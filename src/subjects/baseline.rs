@@ -3,7 +3,7 @@
 //! This is the floor for the read path (one atomic load) and for the write path (one
 //! allocation and one atomic swap).
 
-use crate::{Subject, Val};
+use crate::{Kind, Subject, Val};
 use std::sync::atomic::{AtomicPtr, Ordering};
 use std::sync::Arc;
 
@@ -11,6 +11,9 @@ pub struct Leak;
 
 impl Subject for Leak {
     const NAME: &'static str = "baseline-leak";
+    const KIND: Kind = Kind::Reference;
+    const DESC: &'static str =
+        "AtomicPtr whose old values are never freed. The floor: one atomic load per read.";
     type Writer = Arc<AtomicPtr<Val>>;
     type Reader = Arc<AtomicPtr<Val>>;
 

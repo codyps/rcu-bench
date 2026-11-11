@@ -1,9 +1,11 @@
-use crate::{Subject, Val};
+use crate::{Kind, Subject, Val};
 
 pub struct KeepcalmRcu;
 
 impl Subject for KeepcalmRcu {
     const NAME: &'static str = "keepcalm-rcu";
+    const KIND: Kind = Kind::Reference;
+    const DESC: &'static str = "SharedMut::new_rcu, read, set (a parking_lot RwLock<Arc<T>>).";
     type Writer = ::keepcalm::SharedMut<Val>;
     type Reader = ::keepcalm::SharedMut<Val>;
 

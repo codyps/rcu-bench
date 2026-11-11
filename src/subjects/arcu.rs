@@ -1,4 +1,4 @@
-use crate::{Subject, Val};
+use crate::{Kind, Subject, Val};
 use ::arcu::epoch_counters::GlobalEpochCounterPool;
 use ::arcu::Rcu;
 use std::sync::Arc;
@@ -9,6 +9,8 @@ pub struct Arcu;
 
 impl Subject for Arcu {
     const NAME: &'static str = "arcu";
+    const KIND: Kind = Kind::Shared;
+    const DESC: &'static str = "Atomic Arcu with the global, thread-local epoch counter pool.";
     type Writer = Arc<Cell>;
     type Reader = Arc<Cell>;
 

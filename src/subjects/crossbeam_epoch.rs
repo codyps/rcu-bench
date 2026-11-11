@@ -1,4 +1,4 @@
-use crate::{Subject, Val};
+use crate::{Kind, Subject, Val};
 use ::crossbeam_epoch::{self as epoch, Atomic, Owned};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -17,6 +17,9 @@ pub struct CrossbeamEpoch;
 
 impl Subject for CrossbeamEpoch {
     const NAME: &'static str = "crossbeam-epoch";
+    const KIND: Kind = Kind::Framework;
+    const DESC: &'static str =
+        "Atomic<T> in the global collector; pin per read, defer_destroy per write.";
     type Writer = Arc<Cell>;
     type Reader = Arc<Cell>;
 

@@ -1,9 +1,11 @@
-use crate::{Subject, Val};
+use crate::{Kind, Subject, Val};
 
 pub struct SwmrCell;
 
 impl Subject for SwmrCell {
     const NAME: &'static str = "swmr-cell";
+    const KIND: Kind = Kind::SingleWriter;
+    const DESC: &'static str = "LocalReader::pin, SwmrCell::store.";
     type Writer = ::swmr_cell::SwmrCell<Val>;
     type Reader = ::swmr_cell::LocalReader<Val>;
 
@@ -29,6 +31,9 @@ pub struct SwmrCellReadPreferred;
 
 impl Subject for SwmrCellReadPreferred {
     const NAME: &'static str = "swmr-cell-read-preferred";
+    const KIND: Kind = Kind::SingleWriter;
+    const DESC: &'static str =
+        "swmr-cell built with read_preferred(): moves the barrier cost from readers to the writer.";
     type Writer = ::swmr_cell::SwmrCell<Val, true>;
     type Reader = ::swmr_cell::LocalReader<Val, true>;
 

@@ -1,9 +1,11 @@
-use crate::{Subject, Val};
+use crate::{Kind, Subject, Val};
 
 pub struct LocalRcu;
 
 impl Subject for LocalRcu {
     const NAME: &'static str = "local-rcu";
+    const KIND: Kind = Kind::SingleWriter;
+    const DESC: &'static str = "Reader::read, Writer::write.";
     type Writer = ::local_rcu::Writer<Val>;
     type Reader = ::local_rcu::Reader<Val>;
 

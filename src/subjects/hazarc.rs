@@ -1,4 +1,4 @@
-use crate::{Subject, Val};
+use crate::{Kind, Subject, Val};
 use std::sync::Arc;
 
 type Cell = ::hazarc::AtomicArc<Val>;
@@ -7,6 +7,8 @@ pub struct Hazarc;
 
 impl Subject for Hazarc {
     const NAME: &'static str = "hazarc";
+    const KIND: Kind = Kind::Shared;
+    const DESC: &'static str = "AtomicArc::load.";
     type Writer = Arc<Cell>;
     type Reader = Arc<Cell>;
 
@@ -30,6 +32,8 @@ pub struct HazarcCache;
 
 impl Subject for HazarcCache {
     const NAME: &'static str = "hazarc-cache";
+    const KIND: Kind = Kind::Shared;
+    const DESC: &'static str = "A Cache per reader.";
     type Writer = Arc<Cell>;
     type Reader = ::hazarc::Cache<Arc<Cell>>;
 

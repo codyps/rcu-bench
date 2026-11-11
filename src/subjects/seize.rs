@@ -1,4 +1,4 @@
-use crate::{Subject, Val};
+use crate::{Kind, Subject, Val};
 use ::seize::{reclaim, Collector, Guard};
 use std::sync::atomic::{AtomicPtr, Ordering};
 use std::sync::Arc;
@@ -19,6 +19,9 @@ pub struct Seize;
 
 impl Subject for Seize {
     const NAME: &'static str = "seize";
+    const KIND: Kind = Kind::Framework;
+    const DESC: &'static str =
+        "AtomicPtr + a Collector; enter + protect per read, retire per write.";
     type Writer = Arc<Cell>;
     type Reader = Arc<Cell>;
 

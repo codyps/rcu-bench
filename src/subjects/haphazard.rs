@@ -1,4 +1,4 @@
-use crate::{Subject, Val};
+use crate::{Kind, Subject, Val};
 use ::haphazard::{AtomicPtr, HazardPointer};
 use std::sync::Arc;
 
@@ -14,6 +14,8 @@ pub struct Reader {
 
 impl Subject for Haphazard {
     const NAME: &'static str = "haphazard";
+    const KIND: Kind = Kind::Framework;
+    const DESC: &'static str = "AtomicPtr, one HazardPointer kept per reader; retire per write.";
     type Writer = Arc<Cell>;
     type Reader = Reader;
 

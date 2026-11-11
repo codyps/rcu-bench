@@ -28,10 +28,45 @@ impl Val {
     }
 }
 
+/// A rough grouping of the subjects.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Kind {
+    /// One writer handle, one handle per reader.
+    SingleWriter,
+    /// A cell any thread may read or replace, usually handing out `Arc`s.
+    Shared,
+    /// A cell built here on top of a memory reclamation framework.
+    Framework,
+    /// Locks and other points of reference.
+    Reference,
+}
+
+impl Kind {
+    pub fn id(self) -> &'static str {
+        match self {
+            Kind::SingleWriter => "single-writer",
+            Kind::Shared => "shared",
+            Kind::Framework => "framework",
+            Kind::Reference => "reference",
+        }
+    }
+}
+
+/// Name, kind and description of a subject.
+pub struct SubjectInfo {
+    pub name: &'static str,
+    pub kind: Kind,
+    pub desc: &'static str,
+}
+
 /// One crate (or one way of using a crate), reduced to read and write.
 pub trait Subject: 'static {
     /// Name used in benchmark ids and reports. Keep it filesystem friendly.
     const NAME: &'static str;
+    /// What sort of thing this is.
+    const KIND: Kind;
+    /// How the crate is used here, in a sentence.
+    const DESC: &'static str;
 
     /// How many readers the subject supports.
     const MAX_READERS: usize = usize::MAX;
@@ -51,16 +86,20 @@ pub trait Subject: 'static {
     fn write(w: &mut Self::Writer, v: Val);
 }
 
-/// The names of all subjects, in the order of [`for_each_subject`].
-pub fn subject_names() -> Vec<&'static str> {
-    let mut names = Vec::new();
-    macro_rules! name {
+/// All subjects, in the order of [`for_each_subject`].
+pub fn subjects() -> Vec<SubjectInfo> {
+    let mut all = Vec::new();
+    macro_rules! info {
         ($t:ty) => {
-            names.push(<$t as Subject>::NAME);
+            all.push(SubjectInfo {
+                name: <$t as Subject>::NAME,
+                kind: <$t as Subject>::KIND,
+                desc: <$t as Subject>::DESC,
+            });
         };
     }
-    for_each_subject!(name);
-    names
+    for_each_subject!(info);
+    all
 }
 
 /// Calls `$m!(Type)` once for every subject.

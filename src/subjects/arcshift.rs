@@ -1,9 +1,11 @@
-use crate::{Subject, Val};
+use crate::{Kind, Subject, Val};
 
 pub struct ArcShift;
 
 impl Subject for ArcShift {
     const NAME: &'static str = "arcshift";
+    const KIND: Kind = Kind::Shared;
+    const DESC: &'static str = "ArcShift::get (&mut), update.";
     type Writer = ::arcshift::ArcShift<Val>;
     type Reader = ::arcshift::ArcShift<Val>;
 

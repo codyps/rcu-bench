@@ -1,10 +1,12 @@
-use crate::{Subject, Val};
+use crate::{Kind, Subject, Val};
 use tokio::sync::watch;
 
 pub struct TokioWatch;
 
 impl Subject for TokioWatch {
     const NAME: &'static str = "tokio-watch";
+    const KIND: Kind = Kind::Reference;
+    const DESC: &'static str = "Receiver::borrow, Sender::send_replace.";
     type Writer = watch::Sender<Val>;
     type Reader = watch::Receiver<Val>;
 

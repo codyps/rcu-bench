@@ -1,4 +1,4 @@
-use crate::{Subject, Val};
+use crate::{Kind, Subject, Val};
 use ::sdd::{AtomicOwned, Guard, Owned, Tag};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -9,6 +9,8 @@ pub struct Sdd;
 
 impl Subject for Sdd {
     const NAME: &'static str = "sdd";
+    const KIND: Kind = Kind::Framework;
+    const DESC: &'static str = "AtomicOwned; a Guard per read, swap per write.";
     type Writer = Arc<Cell>;
     type Reader = Arc<Cell>;
 

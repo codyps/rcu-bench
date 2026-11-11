@@ -1,4 +1,4 @@
-use crate::{Subject, Val};
+use crate::{Kind, Subject, Val};
 use ::basedrop::{Collector, Handle, Shared, SharedCell};
 use std::sync::Arc;
 
@@ -13,6 +13,9 @@ pub struct Writer {
 
 impl Subject for Basedrop {
     const NAME: &'static str = "basedrop";
+    const KIND: Kind = Kind::Shared;
+    const DESC: &'static str =
+        "SharedCell::get, set; the writer runs the Collector after every write.";
     type Writer = Writer;
     type Reader = Arc<SharedCell<Val>>;
 

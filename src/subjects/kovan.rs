@@ -1,4 +1,4 @@
-use crate::{Subject, Val};
+use crate::{Kind, Subject, Val};
 use std::sync::Arc;
 
 type Cell = ::kovan::Atom<Val>;
@@ -7,6 +7,8 @@ pub struct Kovan;
 
 impl Subject for Kovan {
     const NAME: &'static str = "kovan";
+    const KIND: Kind = Kind::Framework;
+    const DESC: &'static str = "Atom::load, store.";
     type Writer = Arc<Cell>;
     type Reader = Arc<Cell>;
 

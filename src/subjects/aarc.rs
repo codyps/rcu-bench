@@ -1,4 +1,4 @@
-use crate::{Subject, Val};
+use crate::{Kind, Subject, Val};
 use std::sync::Arc;
 
 type Cell = ::aarc::AtomicArc<Val>;
@@ -7,6 +7,8 @@ pub struct Aarc;
 
 impl Subject for Aarc {
     const NAME: &'static str = "aarc";
+    const KIND: Kind = Kind::Shared;
+    const DESC: &'static str = "AtomicArc::load, store.";
     type Writer = Arc<Cell>;
     type Reader = Arc<Cell>;
 

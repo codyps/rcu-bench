@@ -1,4 +1,4 @@
-use crate::{Subject, Val};
+use crate::{Kind, Subject, Val};
 use ::left_right::{Absorb, ReadHandle, WriteHandle};
 
 /// The whole value is the "data structure", and the only operation is "replace it".
@@ -19,6 +19,8 @@ pub struct LeftRight;
 
 impl Subject for LeftRight {
     const NAME: &'static str = "left-right";
+    const KIND: Kind = Kind::SingleWriter;
+    const DESC: &'static str = "The value is the data structure and the only operation replaces it; append + publish per write.";
     type Writer = WriteHandle<Slot, Val>;
     type Reader = ReadHandle<Slot>;
 

@@ -1,9 +1,11 @@
-use crate::{Subject, Val};
+use crate::{Kind, Subject, Val};
 
 pub struct ReadCopyUpdate;
 
 impl Subject for ReadCopyUpdate {
     const NAME: &'static str = "read-copy-update";
+    const KIND: Kind = Kind::SingleWriter;
+    const DESC: &'static str = "Reader::read, Rcu::write.";
     type Writer = ::read_copy_update::Rcu<Val>;
     type Reader = ::read_copy_update::Reader<Val>;
 

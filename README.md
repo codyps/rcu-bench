@@ -7,7 +7,11 @@ reclamation frameworks.
 
 For what each crate does and how they differ in design, see
 [`COMPARISONS.md`](https://github.com/codyps/local-rcu/blob/main/COMPARISONS.md)
-in `local-rcu`. Results from one machine are in [`RESULTS.md`](RESULTS.md).
+in `local-rcu`.
+
+**Results: <https://codyps.github.io/rcu-bench/>** (interactive; rerun by CI on
+every push and weekly). A snapshot from one laptop is in
+[`RESULTS.md`](RESULTS.md).
 
 ## Running
 
@@ -17,6 +21,13 @@ cargo bench                            # run everything (about 10 minutes)
 cargo bench -- 'read-N-writer/'        # one group
 cargo bench -- '/local-rcu$'           # one subject
 cargo run --release --bin report       # markdown table from target/criterion
+```
+
+To look at your own run in the results page:
+
+```sh
+cargo run --release --bin report -- --json > site/results.json
+python3 -m http.server --directory site   # then open http://localhost:8000
 ```
 
 `RCU_BENCH_READERS` sets the number of reader threads `N` (default 4).
@@ -105,9 +116,17 @@ Not included:
 - All threads are unpinned and results depend on the machine. Compare columns
   within one run only.
 
+## CI
+
+[`.github/workflows/bench.yml`](.github/workflows/bench.yml) runs the smoke
+tests and the benchmarks, then publishes [`site/`](site) with a fresh
+`results.json` to GitHub Pages. GitHub-hosted runners have 4 cores and noisy
+neighbours, so CI uses `N` = 2 readers and its numbers are rougher than a run
+on a quiet machine.
+
 ## Adding a subject
 
 1. Add the crate to `Cargo.toml` and a module in `src/subjects/` implementing
-   `Subject`.
+   `Subject` (name, kind, a one-line description, and the three operations).
 2. List it in `for_each_subject!` in `src/lib.rs`.
 3. `cargo test --release` checks it sequentially and concurrently.

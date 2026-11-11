@@ -1,10 +1,12 @@
-use crate::{Subject, Val};
+use crate::{Kind, Subject, Val};
 
 /// Single consumer only.
 pub struct TripleBuffer;
 
 impl Subject for TripleBuffer {
     const NAME: &'static str = "triple_buffer";
+    const KIND: Kind = Kind::SingleWriter;
+    const DESC: &'static str = "Output::read, Input::write. One reader only.";
     const MAX_READERS: usize = 1;
     type Writer = ::triple_buffer::Input<Val>;
     type Reader = ::triple_buffer::Output<Val>;

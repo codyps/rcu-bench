@@ -1,6 +1,6 @@
 //! What people reach for first.
 
-use crate::{Subject, Val};
+use crate::{Kind, Subject, Val};
 use std::sync::{Arc, Mutex, RwLock};
 
 /// `Arc<RwLock<T>>`: read in place under the lock.
@@ -8,6 +8,8 @@ pub struct RwLockVal;
 
 impl Subject for RwLockVal {
     const NAME: &'static str = "std-rwlock";
+    const KIND: Kind = Kind::Reference;
+    const DESC: &'static str = "Arc<RwLock<T>>, read in place under the lock.";
     type Writer = Arc<RwLock<Val>>;
     type Reader = Arc<RwLock<Val>>;
 
@@ -31,6 +33,8 @@ pub struct RwLockArc;
 
 impl Subject for RwLockArc {
     const NAME: &'static str = "std-rwlock-arc";
+    const KIND: Kind = Kind::Reference;
+    const DESC: &'static str = "RwLock<Arc<T>>, clone the Arc under the lock.";
     type Writer = Arc<RwLock<Arc<Val>>>;
     type Reader = Arc<RwLock<Arc<Val>>>;
 
@@ -56,6 +60,8 @@ pub struct MutexArc;
 
 impl Subject for MutexArc {
     const NAME: &'static str = "std-mutex-arc";
+    const KIND: Kind = Kind::Reference;
+    const DESC: &'static str = "Mutex<Arc<T>>, clone the Arc under the lock.";
     type Writer = Arc<Mutex<Arc<Val>>>;
     type Reader = Arc<Mutex<Arc<Val>>>;
 

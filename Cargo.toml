@@ -1,0 +1,45 @@
+[package]
+name = "rcu-bench"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "Benchmarks comparing Rust RCU-like single-value cells"
+
+[dependencies]
+local-rcu = "1.0.8"
+
+aarc = "0.4.0"
+arc-swap = "1.9.5"
+arcshift = "0.4.10"
+arcu = { version = "0.1.3", features = ["thread_local_counter"] }
+basedrop = "0.1.3"
+concread = { version = "0.5.12", default-features = false }
+crossbeam-epoch = "0.9.21"
+haphazard = "0.1.8"
+hazarc = "0.2.0"
+keepcalm = "0.6.0"
+kovan = "0.2.6"
+left-right = "0.11.8"
+rcu_cell = "1.2.4"
+read-copy-update = "0.1.0"
+sdd = "4.8.11"
+seize = "0.5.1"
+seqlock = "0.2.0"
+swmr-cell = "0.3.1"
+tokio = { version = "1.54", features = ["sync"] }
+triple_buffer = "9.0.1"
+
+serde_json = "1"
+
+[dev-dependencies]
+criterion = "0.8.2"
+
+[[bench]]
+name = "cells"
+harness = false
+
+[profile.release]
+debug = true
+
+[profile.bench]
+debug = true

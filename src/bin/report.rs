@@ -11,29 +11,90 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicIsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicUsize, Ordering};
 use std::sync::mpsc;
 
-/// The system allocator, counting the allocations that are currently alive.
+/// The system allocator, counting the allocations that are currently alive, and able to
+/// tell whether a few particular ones still are.
 struct Counting;
 
 static LIVE: AtomicIsize = AtomicIsize::new(0);
 
+/// While set, every new allocation is added to [`WATCHED`].
+static RECORD: AtomicBool = AtomicBool::new(false);
+/// Whether [`WATCHED`] may hold anything, so that frees can skip it otherwise.
+static WATCHING: AtomicBool = AtomicBool::new(false);
+/// Addresses of the watched allocations that have not been freed yet (0: empty slot).
+static WATCHED: [AtomicUsize; 64] = [const { AtomicUsize::new(0) }; 64];
+
+impl Counting {
+    fn born(ptr: *mut u8) {
+        LIVE.fetch_add(1, Ordering::Relaxed);
+        if RECORD.load(Ordering::Relaxed) && !ptr.is_null() {
+            Self::replace(0, ptr as usize);
+        }
+    }
+
+    /// Puts `new` into the first slot holding `old`.
+    fn replace(old: usize, new: usize) {
+        for slot in &WATCHED {
+            if slot
+                .compare_exchange(old, new, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+            {
+                return;
+            }
+        }
+    }
+
+    /// Watch the allocations made from now on, until [`Counting::stop_recording`].
+    fn start_recording() {
+        for slot in &WATCHED {
+            slot.store(0, Ordering::Relaxed);
+        }
+        WATCHING.store(true, Ordering::Relaxed);
+        RECORD.store(true, Ordering::Relaxed);
+    }
+
+    fn stop_recording() {
+        RECORD.store(false, Ordering::Relaxed);
+    }
+
+    /// How many of the watched allocations are still alive. Ends the watch.
+    fn watched_alive() -> u64 {
+        let alive = WATCHED
+            .iter()
+            .filter(|slot| slot.load(Ordering::Relaxed) != 0)
+            .count();
+        WATCHING.store(false, Ordering::Relaxed);
+        alive as u64
+    }
+}
+
 unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        LIVE.fetch_add(1, Ordering::Relaxed);
-        unsafe { System.alloc(layout) }
+        let ptr = unsafe { System.alloc(layout) };
+        Self::born(ptr);
+        ptr
     }
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         LIVE.fetch_sub(1, Ordering::Relaxed);
+        if WATCHING.load(Ordering::Relaxed) {
+            Self::replace(ptr as usize, 0);
+        }
         unsafe { System.dealloc(ptr, layout) }
     }
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-        LIVE.fetch_add(1, Ordering::Relaxed);
-        unsafe { System.alloc_zeroed(layout) }
+        let ptr = unsafe { System.alloc_zeroed(layout) };
+        Self::born(ptr);
+        ptr
     }
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        unsafe { System.realloc(ptr, layout, new_size) }
+        let new = unsafe { System.realloc(ptr, layout, new_size) };
+        if WATCHING.load(Ordering::Relaxed) && !new.is_null() && new != ptr {
+            Self::replace(ptr as usize, new as usize);
+        }
+        new
     }
 }
 
@@ -43,31 +104,71 @@ static ALLOC: Counting = Counting;
 /// How many values the writer publishes past an idle reader.
 const IDLE_WRITES: u64 = 100_000;
 
-/// What one idle reader did to a subject.
-struct Idle {
-    /// Allocations still alive after [`IDLE_WRITES`] writes that were not there before them,
-    /// with a reader that read once and then kept its handle without using it.
+/// What is left after the writer has published [`IDLE_WRITES`] values past one reader.
+struct Left {
+    /// Allocations still alive that were not there before those writes.
     retained: u64,
-    /// The same, when that reader dropped its handle and its thread ended before the writes.
-    retained_alone: u64,
+    /// Allocations still alive out of those made to publish the value the reader read.
+    read_value: u64,
 }
 
-impl Idle {
-    /// Whether the reader kept old values from being collected: most of what was written is
-    /// still allocated, and would not be without the reader. Subjects that free in batches
-    /// keep a few hundred at most, far below this.
-    fn blocks(&self) -> bool {
-        self.retained >= IDLE_WRITES / 2 && self.retained_alone < IDLE_WRITES / 2
+/// What one idle reader did to a subject.
+struct Idle {
+    /// With a reader that read once and then kept its handle without using it.
+    idle: Left,
+    /// When that reader dropped its handle and its thread ended before the writes.
+    alone: Left,
+}
+
+/// What an idle reader keeps from being collected.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Keeps {
+    /// Nothing.
+    Nothing,
+    /// The value it read, but nothing published after it.
+    ReadValue,
+    /// The value it read and every value published since.
+    Everything,
+}
+
+impl Keeps {
+    fn id(self) -> &'static str {
+        match self {
+            Keeps::Nothing => "none",
+            Keeps::ReadValue => "one",
+            Keeps::Everything => "all",
+        }
     }
 }
 
-/// One reader reads once on its own thread. With `stays` it then does nothing but keep its
-/// handle; without, it drops the handle and its thread ends. The writer then publishes
-/// [`IDLE_WRITES`] values. Returns how many allocations that left behind.
-fn retained_after_writes<S: Subject>(stays: bool) -> u64 {
+impl Idle {
+    fn keeps(&self) -> Keeps {
+        // Most of what was written is still allocated, and would not be without the reader.
+        // Subjects that free in batches keep a few hundred at most, far below this.
+        if self.idle.retained >= IDLE_WRITES / 2 && self.alone.retained < IDLE_WRITES / 2 {
+            Keeps::Everything
+        } else if self.idle.read_value > self.alone.read_value {
+            Keeps::ReadValue
+        } else {
+            Keeps::Nothing
+        }
+    }
+}
+
+/// The writer publishes a value, and one reader reads it on its own thread. With `stays` the
+/// reader then does nothing but keep its handle; without, it drops the handle and its thread
+/// ends. The writer then publishes [`IDLE_WRITES`] more values.
+fn left_after_writes<S: Subject>(stays: bool) -> Left {
     let (mut w, mut rs) = S::new(Val::new(0), 1);
     let mut r = rs.pop().expect("one reader");
     drop(rs);
+    // whatever the first write sets up is not part of the value
+    S::write(&mut w, Val::new(1));
+    // the value the reader is going to read: watch what is allocated to publish it
+    Counting::start_recording();
+    S::write(&mut w, Val::new(2));
+    Counting::stop_recording();
+
     let (has_read, wait_read) = mpsc::channel();
     let (finish, wait_finish) = mpsc::channel::<()>();
     let reader = std::thread::spawn(move || {
@@ -89,21 +190,25 @@ fn retained_after_writes<S: Subject>(stays: bool) -> u64 {
 
     let before = LIVE.load(Ordering::Relaxed);
     for i in 1..=IDLE_WRITES {
-        S::write(&mut w, Val::new(i));
+        S::write(&mut w, Val::new(2 + i));
     }
     let after = LIVE.load(Ordering::Relaxed);
+    let read_value = Counting::watched_alive();
 
     drop(finish);
     if let Some(reader) = reader {
         reader.join().unwrap();
     }
-    (after - before).max(0) as u64
+    Left {
+        retained: (after - before).max(0) as u64,
+        read_value,
+    }
 }
 
 fn idle<S: Subject>() -> Idle {
     Idle {
-        retained_alone: retained_after_writes::<S>(false),
-        retained: retained_after_writes::<S>(true),
+        alone: left_after_writes::<S>(false),
+        idle: left_after_writes::<S>(true),
     }
 }
 
@@ -231,19 +336,24 @@ fn markdown(dir: &Path) -> bool {
     if found {
         println!("### Idle readers\n");
         println!(
-            "One reader reads once and then does nothing, while the writer publishes \
-             {IDLE_WRITES} values. Allocations still alive afterwards, and for comparison \
-             when the reader is gone before the writes.\n"
+            "The writer publishes a value, one reader reads it and then does nothing, and the \
+             writer publishes {IDLE_WRITES} more. \"Left\" counts the allocations made by those \
+             writes that are still alive, \"read value\" whether the allocations of the value \
+             the reader read are; both also for a reader that is gone before the writes.\n"
         );
         println!(
-            "| Subject | Still allocated | Without the reader | Idle reader blocks collection |"
+            "| Subject | Left | Read value | Left, no reader | Read value, no reader | Idle reader keeps |"
         );
-        println!("|---|---:|---:|---|");
+        println!("|---|---:|---:|---:|---:|---|");
         for (s, i) in rcu_bench::subjects().iter().zip(idle_all()) {
-            let blocks = if i.blocks() { "**yes**" } else { "no" };
+            let keeps = match i.keeps() {
+                Keeps::Nothing => "nothing",
+                Keeps::ReadValue => "**the value it read**",
+                Keeps::Everything => "**everything since its read**",
+            };
             println!(
-                "| `{}` | {} | {} | {blocks} |",
-                s.name, i.retained, i.retained_alone
+                "| `{}` | {} | {} | {} | {} | {keeps} |",
+                s.name, i.idle.retained, i.idle.read_value, i.alone.retained, i.alone.read_value
             );
         }
         println!();
@@ -279,9 +389,12 @@ fn json(dir: &Path) -> bool {
                 "desc": s.desc,
                 "idle": {
                     "writes": IDLE_WRITES,
-                    "retained": idle.retained,
-                    "retained_alone": idle.retained_alone,
-                    "blocks": idle.blocks(),
+                    "retained": idle.idle.retained,
+                    "retained_alone": idle.alone.retained,
+                    "read_value": idle.idle.read_value,
+                    "read_value_alone": idle.alone.read_value,
+                    "keeps": idle.keeps().id(),
+                    "blocks": idle.keeps() == Keeps::Everything,
                 },
                 "results": results,
             })

@@ -255,10 +255,12 @@ ul.caveats li { margin-bottom: 4px; }
         Both are far harsher than a typical read-mostly workload.</li>
       <li>The CI machines have 4 CPUs. Reads without a writer go up to 4 readers; with a writer the sweep stops at 3 so the writer has a CPU of its own.</li>
       <li>The range drawn around each dot on the log scale is criterion's 95% confidence interval for the median.</li>
-      <li><span class="hold">◆</span> marks subjects whose readers keep old values alive while idle. It is measured, not declared:
-        one reader reads once and then does nothing while the writer publishes 100,000 values, and the allocations still alive
-        afterwards are counted. A subject is marked when most are still alive and would not be had the reader gone away first.
-        <code>local-rcu-cached</code> is marked by design (call <code>release()</code> before going idle); plain <code>local-rcu</code> is not.</li>
+      <li><span class="hold">◆</span> and <span class="hold">◇</span> mark subjects whose readers keep old values alive while idle.
+        It is measured, not declared: the writer publishes a value, one reader reads it and then does nothing, and the writer
+        publishes 100,000 more. <span class="hold">◆</span>: most of those are still allocated afterwards, and would not be had the
+        reader gone away first. <span class="hold">◇</span>: only the value the reader read is still allocated, typically because
+        the reader holds an <code>Arc</code> of it. <code>local-rcu-cached</code> is ◆ by design (call <code>release()</code>
+        before going idle); plain <code>local-rcu</code> keeps nothing.</li>
       <li><code>baseline-leak</code> never frees anything. It is the floor, not a contender.</li>
     </ul>
   </div>
@@ -278,8 +280,12 @@ const SELF = "local-rcu";
 /* subjects that are emphasised everywhere: local-rcu itself and its other readers */
 const OURS = new Set([SELF, "local-rcu-cached"]);
 const isOurs = (name) => OURS.has(name);
-/* marks a subject whose idle readers keep old values from being collected */
-const HOLD = "◆";
+/* marks for what a subject's idle readers keep from being collected */
+const HOLD = { all: "◆", one: "◇" };
+const HOLD_KEY = {
+  all: "A reader that stops reading keeps the value it read, and every value published since, from being freed.",
+  one: "A reader that stops reading keeps the one value it read from being freed, but nothing newer.",
+};
 const SVG = "http://www.w3.org/2000/svg";
 
 const state = {
@@ -335,17 +341,28 @@ const fmtCount = (n) => n.toLocaleString("en-US");
 /* `idle` is measured by the report tool: a reader reads once and then does nothing while the
    writer publishes `writes` values; `retained` allocations are still alive afterwards
    (`retained_alone` when the reader was gone before the writes). Older results lack it. */
-const holds = (s) => !!(s.idle && s.idle.blocks);
+/* "all", "one" or null. Results from before `keeps` existed only know `blocks`. */
+function holds(s) {
+  const i = s.idle;
+  if (!i) return null;
+  const k = i.keeps || (i.blocks ? "all" : "none");
+  return k in HOLD ? k : null;
+}
+const holdMark = (s) => HOLD[holds(s)];
+const holdAria = (s) => ({ all: ", an idle reader keeps every value since its last read alive", one: ", an idle reader keeps the value it last read alive" }[holds(s)] || "");
 function idleText(s) {
   const i = s.idle;
   if (!i) return null;
-  if (i.blocks) return `blocks collection: ${fmtCount(i.retained)} allocations left after ${fmtCount(i.writes)} writes`;
+  const left = `${fmtCount(i.retained)} allocations left after ${fmtCount(i.writes)} writes`;
+  if (holds(s) === "all") return `keeps every value since its last read: ${left}`;
+  if (holds(s) === "one") return `keeps the value it last read, nothing newer (${left})`;
   if (i.retained_alone >= i.writes / 2) return "no effect; old values are not freed in this test even without a reader";
-  return `holds nothing back (${fmtCount(i.retained)} allocations left after ${fmtCount(i.writes)} writes)`;
+  return `keeps nothing (${left})`;
 }
 function holdKey(host, subjects) {
-  if (!subjects.some(holds)) return;
-  host.append(" ", el("span", { class: "hold" }, HOLD), " A reader that stops reading keeps the old values published since from being freed.");
+  for (const k in HOLD) {
+    if (subjects.some((s) => holds(s) === k)) host.append(" ", el("span", { class: "hold" }, HOLD[k]), " " + HOLD_KEY[k]);
+  }
 }
 const readersLabel = (r) => (r === 0 ? "no readers" : r === 1 ? "1 reader" : `${r} readers`);
 
@@ -513,11 +530,11 @@ function renderChart() {
       class: "row" + (s.name === state.pinned ? " pinned" : ""),
       tabindex: 0, role: "listitem",
       "aria-label": `${s.name}: ${fmt(r.median)}` + (ratio && s.name !== SELF ? `, ${fmtRatio(ratio)} local-rcu` : "")
-        + (holds(s) ? ", an idle reader blocks collection of old values" : ""),
+        + holdAria(s),
     });
     row.append(svg("rect", { class: "bg", x: 0, y: y + 1, width: W, height: rowH - 2, rx: 5 }));
     const name = svg("text", { class: "name" + (isOurs(s.name) ? " self" : ""), x: labelW, y: cy + 4, "text-anchor": "end" }, s.name);
-    if (holds(s)) name.append(svg("tspan", { class: "hold", dx: 5 }, HOLD));
+    if (holds(s)) name.append(svg("tspan", { class: "hold", dx: 5 }, holdMark(s)));
     row.append(name);
 
     if (state.scale === "log") {
@@ -640,7 +657,7 @@ function renderScaling() {
   for (let i = 1; i < labels.length; i++) if (labels[i].y - labels[i - 1].y < 15) labels[i].y = labels[i - 1].y + 15;
   for (const lb of labels) {
     const t = svg("text", { class: "endlabel" + (isOurs(lb.l.s.name) ? " self" : ""), x: lb.x, y: lb.y }, lb.l.s.name);
-    if (holds(lb.l.s)) t.append(svg("tspan", { class: "hold", dx: 5 }, HOLD));
+    if (holds(lb.l.s)) t.append(svg("tspan", { class: "hold", dx: 5 }, holdMark(lb.l.s)));
     root.append(t);
   }
 
@@ -778,7 +795,7 @@ function renderTable() {
     const sw = el("span", { class: "swatch" });
     sw.style.background = kindColor(s.kind);
     firstCell.append(sw, s.name);
-    if (holds(s)) firstCell.append(el("span", { class: "hold" }, HOLD));
+    if (holds(s)) firstCell.append(el("span", { class: "hold" }, holdMark(s)));
     firstCell.title = s.desc;
     row.append(firstCell);
     for (const r of cs) {
@@ -791,7 +808,7 @@ function renderTable() {
     if (hasIdle) {
       const td = el("td", {}, s.idle ? fmtCount(s.idle.retained) : "—");
       if (!s.idle) td.classList.add("none");
-      if (holds(s)) td.classList.add("hold");
+      if (holds(s) === "all") td.classList.add("hold");
       if (s.idle) td.title = `Idle reader ${idleText(s)}.`;
       row.append(td);
     }

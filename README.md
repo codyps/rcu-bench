@@ -60,7 +60,7 @@ and whatever the crate does about the old one.
 |---|---|---|
 | `baseline-leak` | — | `AtomicPtr`, old values are never freed. The floor: one atomic load per read |
 | `local-rcu` | `local-rcu` | `Reader::read`, `Writer::write` |
-| `local-rcu-cached` | `local-rcu` | `cached::CachedReader::read` (stays in its read section between reads), `Writer::write`. Unreleased, from [local-rcu#15](https://github.com/codyps/local-rcu/pull/15) |
+| `local-rcu-cached` | `local-rcu` | `cached::CachedReader::read` (stays in its read section between reads), `Writer::write` |
 | `std-rwlock` | std | `Arc<RwLock<T>>`, read in place under the lock |
 | `std-rwlock-arc` | std | `RwLock<Arc<T>>`, clone the `Arc` under the lock |
 | `std-mutex-arc` | std | `Mutex<Arc<T>>`, clone the `Arc` under the lock |

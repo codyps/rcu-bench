@@ -61,6 +61,7 @@ and whatever the crate does about the old one.
 | `baseline-leak` | — | `AtomicPtr`, old values are never freed. The floor: one atomic load per read |
 | `local-rcu` | `local-rcu` | `Reader::read`, `Writer::write` |
 | `local-rcu-cached` | `local-rcu` | `cached::CachedReader::read` (stays in its read section between reads), `Writer::write` |
+| `local-rcu-batched` | `local-rcu` | `Reader::read`, `Writer::write_nosync` (a pointer store that leaves the readers alone); old values are scanned for and collected in batches (`try_sync`) once every 128 writes, the way an epoch collector does |
 | `std-rwlock` | std | `Arc<RwLock<T>>`, read in place under the lock |
 | `std-rwlock-arc` | std | `RwLock<Arc<T>>`, clone the `Arc` under the lock |
 | `std-mutex-arc` | std | `Mutex<Arc<T>>`, clone the `Arc` under the lock |
@@ -127,6 +128,13 @@ Not included:
   `read-copy-update`), and ◇ those where it keeps only the value it read
   (`arc-swap-cache`, `hazarc-cache`, `arcshift`). The markdown report lists
   the same under "Idle readers".
+- `report` also checks for batched reclamation: with no reader at all, the
+  writer publishes 100,000 values and stops. Subjects that still have a batch
+  of old values allocated then (8 or more, short of all of them) are marked ≡
+  on the page: `local-rcu-batched`, `swmr-cell`, `crossbeam-epoch`,
+  `haphazard`, `kovan`. The count is repeated after 200 ms of nothing
+  happening, to tell apart subjects where a background task does the freeing
+  (↻). None of the subjects has one as used here.
 - All threads are unpinned and results depend on the machine. Compare columns
   within one run only.
 

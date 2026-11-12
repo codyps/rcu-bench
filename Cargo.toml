@@ -6,7 +6,8 @@ publish = false
 description = "Benchmarks comparing Rust RCU-like single-value cells"
 
 [dependencies]
-local-rcu = "1.1.0"
+# from git until the batched `write_nosync()` (codyps/local-rcu#17) is released
+local-rcu = { git = "https://github.com/codyps/local-rcu" }
 
 aarc = "0.4.0"
 arc-swap = "1.9.5"

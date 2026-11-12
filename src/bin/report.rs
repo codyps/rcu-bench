@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicUsize, Ordering};
 use std::sync::mpsc;
+use std::time::Duration;
 
 /// The system allocator, counting the allocations that are currently alive, and able to
 /// tell whether a few particular ones still are.
@@ -110,6 +111,40 @@ struct Left {
     retained: u64,
     /// Allocations still alive out of those made to publish the value the reader read.
     read_value: u64,
+    /// `retained` again, after everything has been idle for [`REST`].
+    retained_later: u64,
+}
+
+/// How long everything stays idle before the allocations are counted a second time.
+const REST: Duration = Duration::from_millis(200);
+
+/// Fewer allocations than this left behind are not called a batch: a value or two kept for
+/// the subject's own purposes, or the odd allocation of the measurement itself.
+const BATCH_MIN: u64 = 8;
+
+/// When a subject frees the values that nobody can reach any more.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Reclaim {
+    /// As part of the write that replaces them (give or take a few).
+    Prompt,
+    /// In batches, as part of later writes: some are left when the writer stops writing.
+    Batched,
+    /// In batches, by something that runs without the writer: some are left when the writer
+    /// stops writing, and are gone a moment later.
+    Background,
+    /// Not in this test: most of what was written is still allocated.
+    Never,
+}
+
+impl Reclaim {
+    fn id(self) -> &'static str {
+        match self {
+            Reclaim::Prompt => "prompt",
+            Reclaim::Batched => "batched",
+            Reclaim::Background => "background",
+            Reclaim::Never => "never",
+        }
+    }
 }
 
 /// What one idle reader did to a subject.
@@ -142,6 +177,20 @@ impl Keeps {
 }
 
 impl Idle {
+    /// Judged with no reader around at all, so that only the subject's own timing counts.
+    fn reclaim(&self) -> Reclaim {
+        let (left, later) = (self.alone.retained, self.alone.retained_later);
+        if left < BATCH_MIN {
+            Reclaim::Prompt
+        } else if later < BATCH_MIN {
+            Reclaim::Background
+        } else if left >= IDLE_WRITES / 2 {
+            Reclaim::Never
+        } else {
+            Reclaim::Batched
+        }
+    }
+
     fn keeps(&self) -> Keeps {
         // Most of what was written is still allocated, and would not be without the reader.
         // Subjects that free in batches keep a few hundred at most, far below this.
@@ -194,6 +243,9 @@ fn left_after_writes<S: Subject>(stays: bool) -> Left {
     }
     let after = LIVE.load(Ordering::Relaxed);
     let read_value = Counting::watched_alive();
+    // the writer has stopped: does anything free what it left behind?
+    std::thread::sleep(REST);
+    let later = LIVE.load(Ordering::Relaxed);
 
     drop(finish);
     if let Some(reader) = reader {
@@ -202,6 +254,7 @@ fn left_after_writes<S: Subject>(stays: bool) -> Left {
     Left {
         retained: (after - before).max(0) as u64,
         read_value,
+        retained_later: (later - before).max(0) as u64,
     }
 }
 
@@ -334,26 +387,39 @@ fn markdown(dir: &Path) -> bool {
         println!();
     }
     if found {
-        println!("### Idle readers\n");
+        println!("### Idle readers and idle writers\n");
         println!(
             "The writer publishes a value, one reader reads it and then does nothing, and the \
              writer publishes {IDLE_WRITES} more. \"Left\" counts the allocations made by those \
              writes that are still alive, \"read value\" whether the allocations of the value \
-             the reader read are; both also for a reader that is gone before the writes.\n"
+             the reader read are. The \"no reader\" columns repeat this with the reader gone \
+             before the writes, and once more after {} ms of nothing happening: what is left \
+             there is left by the subject itself, because it frees in batches.\n",
+            REST.as_millis()
         );
         println!(
-            "| Subject | Left | Read value | Left, no reader | Read value, no reader | Idle reader keeps |"
+            "| Subject | Left | Read value | Left, no reader | Later | Idle reader keeps | Reclaims |"
         );
-        println!("|---|---:|---:|---:|---:|---|");
+        println!("|---|---:|---:|---:|---:|---|---|");
         for (s, i) in rcu_bench::subjects().iter().zip(idle_all()) {
             let keeps = match i.keeps() {
                 Keeps::Nothing => "nothing",
                 Keeps::ReadValue => "**the value it read**",
                 Keeps::Everything => "**everything since its read**",
             };
+            let reclaim = match i.reclaim() {
+                Reclaim::Prompt => "with each write",
+                Reclaim::Batched => "**in batches, on later writes**",
+                Reclaim::Background => "**in batches, in the background**",
+                Reclaim::Never => "not in this test",
+            };
             println!(
-                "| `{}` | {} | {} | {} | {} | {keeps} |",
-                s.name, i.idle.retained, i.idle.read_value, i.alone.retained, i.alone.read_value
+                "| `{}` | {} | {} | {} | {} | {keeps} | {reclaim} |",
+                s.name,
+                i.idle.retained,
+                i.idle.read_value,
+                i.alone.retained,
+                i.alone.retained_later
             );
         }
         println!();
@@ -395,6 +461,10 @@ fn json(dir: &Path) -> bool {
                     "read_value_alone": idle.alone.read_value,
                     "keeps": idle.keeps().id(),
                     "blocks": idle.keeps() == Keeps::Everything,
+                    "left_at_rest": idle.alone.retained,
+                    "left_at_rest_later": idle.alone.retained_later,
+                    "rest_ms": REST.as_millis() as u64,
+                    "reclaim": idle.reclaim().id(),
                 },
                 "results": results,
             })

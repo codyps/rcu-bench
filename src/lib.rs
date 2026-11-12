@@ -109,6 +109,7 @@ macro_rules! for_each_subject {
         $m!($crate::subjects::baseline::Leak);
         $m!($crate::subjects::local_rcu::LocalRcu);
         $m!($crate::subjects::local_rcu::LocalRcuCached);
+        $m!($crate::subjects::local_rcu::LocalRcuBatched);
         $m!($crate::subjects::std_locks::RwLockVal);
         $m!($crate::subjects::std_locks::RwLockArc);
         $m!($crate::subjects::std_locks::MutexArc);

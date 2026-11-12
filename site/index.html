@@ -23,6 +23,7 @@
   --k-framework: #1baf7a;
   --k-reference: #898781;
   --accent: #2a78d6;
+  --hold: #b45309;
 }
 @media (prefers-color-scheme: dark) {
   :root {
@@ -42,6 +43,7 @@
     --k-framework: #199e70;
     --k-reference: #898781;
     --accent: #3987e5;
+    --hold: #f0a23a;
   }
 }
 * { box-sizing: border-box; }
@@ -96,6 +98,8 @@ button:focus-visible, [tabindex]:focus-visible, th button:focus-visible { outlin
 #chart .tick { fill: var(--muted); font-size: 11.5px; font-variant-numeric: tabular-nums; }
 #chart .name { fill: var(--ink); }
 #chart .name.self { font-weight: 700; }
+#chart .hold, .hold { fill: var(--hold); color: var(--hold); font-weight: 400; }
+td span.hold { margin-left: 0.4em; }
 #chart .val { fill: var(--ink); font-variant-numeric: tabular-nums; }
 #chart .ratio { fill: var(--muted); font-size: 11.5px; font-variant-numeric: tabular-nums; }
 #chart .row { cursor: pointer; outline: none; }
@@ -236,7 +240,7 @@ ul.caveats li { margin-bottom: 4px; }
     </section>
 
     <h2 id="table-title">All reader counts</h2>
-    <p class="lede">Median time per operation. Click a column to sort by it, click a row to pin it in the charts.</p>
+    <p class="lede" id="table-desc">Median time per operation. Click a column to sort by it, click a row to pin it in the charts.</p>
     <section class="card" style="margin-top:12px">
       <div class="tablewrap"><table aria-labelledby="table-title"><thead></thead><tbody></tbody></table></div>
     </section>
@@ -251,6 +255,10 @@ ul.caveats li { margin-bottom: 4px; }
         Both are far harsher than a typical read-mostly workload.</li>
       <li>The CI machines have 4 CPUs. Reads without a writer go up to 4 readers; with a writer the sweep stops at 3 so the writer has a CPU of its own.</li>
       <li>The range drawn around each dot on the log scale is criterion's 95% confidence interval for the median.</li>
+      <li><span class="hold">◆</span> marks subjects whose readers keep old values alive while idle. It is measured, not declared:
+        one reader reads once and then does nothing while the writer publishes 100,000 values, and the allocations still alive
+        afterwards are counted. A subject is marked when most are still alive and would not be had the reader gone away first.
+        <code>local-rcu-cached</code> is marked by design (call <code>release()</code> before going idle); plain <code>local-rcu</code> is not.</li>
       <li><code>baseline-leak</code> never frees anything. It is the floor, not a contender.</li>
     </ul>
   </div>
@@ -265,7 +273,13 @@ const KINDS = [
   { id: "framework", label: "On a reclamation framework" },
   { id: "reference", label: "Locks & reference points" },
 ];
+/* the subject every ratio is measured against */
 const SELF = "local-rcu";
+/* subjects that are emphasised everywhere: local-rcu itself and its other readers */
+const OURS = new Set([SELF, "local-rcu-cached"]);
+const isOurs = (name) => OURS.has(name);
+/* marks a subject whose idle readers keep old values from being collected */
+const HOLD = "◆";
 const SVG = "http://www.w3.org/2000/svg";
 
 const state = {
@@ -317,6 +331,22 @@ function fmtTick(ns) {
   return +ns.toPrecision(3) + " ns";
 }
 const fmtRelTick = (v) => +v.toPrecision(3) + "×";
+const fmtCount = (n) => n.toLocaleString("en-US");
+/* `idle` is measured by the report tool: a reader reads once and then does nothing while the
+   writer publishes `writes` values; `retained` allocations are still alive afterwards
+   (`retained_alone` when the reader was gone before the writes). Older results lack it. */
+const holds = (s) => !!(s.idle && s.idle.blocks);
+function idleText(s) {
+  const i = s.idle;
+  if (!i) return null;
+  if (i.blocks) return `blocks collection: ${fmtCount(i.retained)} allocations left after ${fmtCount(i.writes)} writes`;
+  if (i.retained_alone >= i.writes / 2) return "no effect; old values are not freed in this test even without a reader";
+  return `holds nothing back (${fmtCount(i.retained)} allocations left after ${fmtCount(i.writes)} writes)`;
+}
+function holdKey(host, subjects) {
+  if (!subjects.some(holds)) return;
+  host.append(" ", el("span", { class: "hold" }, HOLD), " A reader that stops reading keeps the old values published since from being freed.");
+}
 const readersLabel = (r) => (r === 0 ? "no readers" : r === 1 ? "1 reader" : `${r} readers`);
 
 /* ---------- data access ---------- */
@@ -482,10 +512,13 @@ function renderChart() {
     const row = svg("g", {
       class: "row" + (s.name === state.pinned ? " pinned" : ""),
       tabindex: 0, role: "listitem",
-      "aria-label": `${s.name}: ${fmt(r.median)}` + (ratio && s.name !== SELF ? `, ${fmtRatio(ratio)} local-rcu` : ""),
+      "aria-label": `${s.name}: ${fmt(r.median)}` + (ratio && s.name !== SELF ? `, ${fmtRatio(ratio)} local-rcu` : "")
+        + (holds(s) ? ", an idle reader blocks collection of old values" : ""),
     });
     row.append(svg("rect", { class: "bg", x: 0, y: y + 1, width: W, height: rowH - 2, rx: 5 }));
-    row.append(svg("text", { class: "name" + (s.name === SELF ? " self" : ""), x: labelW, y: cy + 4, "text-anchor": "end" }, s.name));
+    const name = svg("text", { class: "name" + (isOurs(s.name) ? " self" : ""), x: labelW, y: cy + 4, "text-anchor": "end" }, s.name);
+    if (holds(s)) name.append(svg("tspan", { class: "hold", dx: 5 }, HOLD));
+    row.append(name);
 
     if (state.scale === "log") {
       const x1 = x(r.lo), x2 = x(r.hi);
@@ -523,6 +556,7 @@ function renderChart() {
   if (selfVal != null && selfShown) notes.push("The vertical line marks local-rcu.");
   if (missing.length) notes.push(`Not measured here: ${missing.join(", ")}.`);
   $("#chart-note").textContent = notes.join(" ");
+  holdKey($("#chart-note"), rows);
 }
 function fitNames(root, sel, max) {
   for (const t of root.querySelectorAll(sel)) {
@@ -587,7 +621,7 @@ function renderScaling() {
     root.append(svg("line", { class: "cur", x1: xs(state.readers), x2: xs(state.readers), y1: top, y2: top + plotH }));
   }
 
-  const strong = (name) => name === SELF || name === state.pinned || name === state.hover;
+  const strong = (name) => isOurs(name) || name === state.pinned || name === state.hover;
   // weak lines first so the emphasised ones sit on top
   const ordered = [...lines].sort((a, b) => strong(a.s.name) - strong(b.s.name));
   for (const l of ordered) {
@@ -605,7 +639,9 @@ function renderScaling() {
   }).sort((a, b) => a.y - b.y);
   for (let i = 1; i < labels.length; i++) if (labels[i].y - labels[i - 1].y < 15) labels[i].y = labels[i - 1].y + 15;
   for (const lb of labels) {
-    root.append(svg("text", { class: "endlabel" + (lb.l.s.name === SELF ? " self" : ""), x: lb.x, y: lb.y }, lb.l.s.name));
+    const t = svg("text", { class: "endlabel" + (isOurs(lb.l.s.name) ? " self" : ""), x: lb.x, y: lb.y }, lb.l.s.name);
+    if (holds(lb.l.s)) t.append(svg("tspan", { class: "hold", dx: 5 }, HOLD));
+    root.append(t);
   }
 
   // one hit layer: the pointer only has to be closest to a point
@@ -634,9 +670,11 @@ function renderScaling() {
   fitNames(root, "text.endlabel", padR - 14);
 
   const dropped = run().subjects.filter((s) => !state.hidden.has(s.kind) && !lines.some((l) => l.s === s)).map((s) => s.name);
-  const notes = ["local-rcu is always drawn in full. Point at a line for its numbers, click to pin it."];
+  const ours = lines.map((l) => l.s.name).filter(isOurs);
+  const notes = [(ours.length ? `${ours.join(" and ")} ${ours.length > 1 ? "are" : "is"} always drawn in full. ` : "") + "Point at a line for its numbers, click to pin it."];
   if (dropped.length) notes.push(`No trend for: ${dropped.join(", ")} (fewer than two reader counts).`);
   $("#scaling-note").textContent = notes.join(" ");
+  holdKey($("#scaling-note"), lines.map((l) => l.s).filter((x) => strong(x.name)));
 }
 
 /* ---------- tooltips ---------- */
@@ -672,6 +710,7 @@ function showRowTip(s, ratio, ev, anchor) {
   add("95% CI", `${fmt(r.lo)} – ${fmt(r.hi)}`);
   if (ratio && s.name !== SELF) add("vs local-rcu", ratio >= 1 ? `${fmtRatio(ratio)} slower` : `${fmtRatio(1 / ratio)} faster`);
   add("Kind", kindLabel(s.kind));
+  if (idleText(s)) add("Idle reader", idleText(s));
   tip.append(dl, el("p", { class: "t-desc" }, s.desc));
   placeTip(ev, anchor);
 }
@@ -687,6 +726,7 @@ function showLineTip(l, r, ev) {
   }
   t.append(tb);
   tip.append(t);
+  if (holds(l.s)) tip.append(el("p", { class: "t-desc" }, `Idle reader ${idleText(l.s)}.`));
   placeTip(ev, null);
 }
 function hideTip() { $("#tip").style.display = "none"; }
@@ -712,25 +752,33 @@ function renderTable() {
   };
   mk("Subject", "name");
   for (const r of cs) mk(readersLabel(r), r);
+  const hasIdle = run().subjects.some((s) => s.idle);
+  if (hasIdle) mk("Left by an idle reader", "idle");
   thead.append(tr);
 
   const subjects = run().subjects.filter((s) => !state.hidden.has(s.kind));
-  const col = state.sort.col != null && (state.sort.col === "name" || cs.includes(state.sort.col)) ? state.sort.col : state.readers;
+  const sortable = state.sort.col === "name" || (state.sort.col === "idle" && hasIdle) || cs.includes(state.sort.col);
+  const col = state.sort.col != null && sortable ? state.sort.col : state.readers;
   const dir = state.sort.col === col ? state.sort.dir : 1;
   subjects.sort((a, b) => {
     if (col === "name") return dir * a.name.localeCompare(b.name);
+    if (col === "idle") {
+      if (!a.idle || !b.idle) return (a.idle ? -1 : 0) - (b.idle ? -1 : 0);
+      return dir * (a.idle.retained - b.idle.retained) || a.name.localeCompare(b.name);
+    }
     const av = series(a)[col], bv = series(b)[col];
     if (!av || !bv) return (av ? -1 : 0) - (bv ? -1 : 0);
     return dir * (av.median - bv.median);
   });
   for (const s of subjects) {
     const row = el("tr");
-    if (s.name === SELF) row.classList.add("self");
+    if (isOurs(s.name)) row.classList.add("self");
     if (s.name === state.pinned) row.classList.add("pinned");
     const firstCell = el("td");
     const sw = el("span", { class: "swatch" });
     sw.style.background = kindColor(s.kind);
     firstCell.append(sw, s.name);
+    if (holds(s)) firstCell.append(el("span", { class: "hold" }, HOLD));
     firstCell.title = s.desc;
     row.append(firstCell);
     for (const r of cs) {
@@ -740,10 +788,24 @@ function renderTable() {
       if (r === state.readers) td.classList.add("cur");
       row.append(td);
     }
+    if (hasIdle) {
+      const td = el("td", {}, s.idle ? fmtCount(s.idle.retained) : "—");
+      if (!s.idle) td.classList.add("none");
+      if (holds(s)) td.classList.add("hold");
+      if (s.idle) td.title = `Idle reader ${idleText(s)}.`;
+      row.append(td);
+    }
     row.addEventListener("click", () => togglePin(s.name));
     tbody.append(row);
   }
   $("#table-title").textContent = `${group().title}: all reader counts`;
+  const desc = $("#table-desc");
+  desc.textContent = "Median time per operation. Click a column to sort by it, click a row to pin it in the charts.";
+  if (hasIdle) {
+    const w = (run().subjects.find((s) => s.idle) || {}).idle.writes;
+    desc.append(` The last column is not a time: it counts the allocations still alive after ${fmtCount(w)} writes past a reader that read once and then went idle.`);
+    holdKey(desc, subjects);
+  }
 }
 
 function update() {

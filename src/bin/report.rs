@@ -2,11 +2,122 @@
 //! file the results page reads.
 //!
 //! Usage: `cargo run --release --bin report [--json] [criterion-dir]`
+//!
+//! It also measures, right here, what an idle reader does to each subject: see [`idle`].
 
+use rcu_bench::{for_each_subject, Subject, Val};
 use serde_json::{json, Value};
+use std::alloc::{GlobalAlloc, Layout, System};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicIsize, Ordering};
+use std::sync::mpsc;
+
+/// The system allocator, counting the allocations that are currently alive.
+struct Counting;
+
+static LIVE: AtomicIsize = AtomicIsize::new(0);
+
+unsafe impl GlobalAlloc for Counting {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        LIVE.fetch_add(1, Ordering::Relaxed);
+        unsafe { System.alloc(layout) }
+    }
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        LIVE.fetch_sub(1, Ordering::Relaxed);
+        unsafe { System.dealloc(ptr, layout) }
+    }
+    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+        LIVE.fetch_add(1, Ordering::Relaxed);
+        unsafe { System.alloc_zeroed(layout) }
+    }
+    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        unsafe { System.realloc(ptr, layout, new_size) }
+    }
+}
+
+#[global_allocator]
+static ALLOC: Counting = Counting;
+
+/// How many values the writer publishes past an idle reader.
+const IDLE_WRITES: u64 = 100_000;
+
+/// What one idle reader did to a subject.
+struct Idle {
+    /// Allocations still alive after [`IDLE_WRITES`] writes that were not there before them,
+    /// with a reader that read once and then kept its handle without using it.
+    retained: u64,
+    /// The same, when that reader dropped its handle and its thread ended before the writes.
+    retained_alone: u64,
+}
+
+impl Idle {
+    /// Whether the reader kept old values from being collected: most of what was written is
+    /// still allocated, and would not be without the reader. Subjects that free in batches
+    /// keep a few hundred at most, far below this.
+    fn blocks(&self) -> bool {
+        self.retained >= IDLE_WRITES / 2 && self.retained_alone < IDLE_WRITES / 2
+    }
+}
+
+/// One reader reads once on its own thread. With `stays` it then does nothing but keep its
+/// handle; without, it drops the handle and its thread ends. The writer then publishes
+/// [`IDLE_WRITES`] values. Returns how many allocations that left behind.
+fn retained_after_writes<S: Subject>(stays: bool) -> u64 {
+    let (mut w, mut rs) = S::new(Val::new(0), 1);
+    let mut r = rs.pop().expect("one reader");
+    drop(rs);
+    let (has_read, wait_read) = mpsc::channel();
+    let (finish, wait_finish) = mpsc::channel::<()>();
+    let reader = std::thread::spawn(move || {
+        std::hint::black_box(S::read(&mut r));
+        has_read.send(()).unwrap();
+        if stays {
+            // idle: holds the handle, never reads again
+            let _ = wait_finish.recv();
+        }
+        drop(r);
+    });
+    wait_read.recv().unwrap();
+    let reader = if stays {
+        Some(reader)
+    } else {
+        reader.join().unwrap();
+        None
+    };
+
+    let before = LIVE.load(Ordering::Relaxed);
+    for i in 1..=IDLE_WRITES {
+        S::write(&mut w, Val::new(i));
+    }
+    let after = LIVE.load(Ordering::Relaxed);
+
+    drop(finish);
+    if let Some(reader) = reader {
+        reader.join().unwrap();
+    }
+    (after - before).max(0) as u64
+}
+
+fn idle<S: Subject>() -> Idle {
+    Idle {
+        retained_alone: retained_after_writes::<S>(false),
+        retained: retained_after_writes::<S>(true),
+    }
+}
+
+/// [`idle`] for every subject, in the order of [`rcu_bench::subjects`].
+fn idle_all() -> Vec<Idle> {
+    let mut all = Vec::new();
+    macro_rules! one {
+        ($t:ty) => {
+            all.push(idle::<$t>());
+        };
+    }
+    for_each_subject!(one);
+    all
+}
 
 /// (id, title, what is running, what is reported)
 const GROUPS: &[(&str, &str, &str, &str)] = &[
@@ -117,6 +228,26 @@ fn markdown(dir: &Path) -> bool {
         }
         println!();
     }
+    if found {
+        println!("### Idle readers\n");
+        println!(
+            "One reader reads once and then does nothing, while the writer publishes \
+             {IDLE_WRITES} values. Allocations still alive afterwards, and for comparison \
+             when the reader is gone before the writes.\n"
+        );
+        println!(
+            "| Subject | Still allocated | Without the reader | Idle reader blocks collection |"
+        );
+        println!("|---|---:|---:|---|");
+        for (s, i) in rcu_bench::subjects().iter().zip(idle_all()) {
+            let blocks = if i.blocks() { "**yes**" } else { "no" };
+            println!(
+                "| `{}` | {} | {} | {blocks} |",
+                s.name, i.retained, i.retained_alone
+            );
+        }
+        println!();
+    }
     found
 }
 
@@ -124,7 +255,8 @@ fn json(dir: &Path) -> bool {
     let mut found = false;
     let subjects: Vec<Value> = rcu_bench::subjects()
         .into_iter()
-        .map(|s| {
+        .zip(idle_all())
+        .map(|(s, idle)| {
             let mut results = serde_json::Map::new();
             for g in GROUPS {
                 let by_readers: serde_json::Map<_, _> = estimates(dir, g.0, s.name)
@@ -141,7 +273,18 @@ fn json(dir: &Path) -> bool {
                     results.insert(g.0.into(), by_readers.into());
                 }
             }
-            json!({ "name": s.name, "kind": s.kind.id(), "desc": s.desc, "results": results })
+            json!({
+                "name": s.name,
+                "kind": s.kind.id(),
+                "desc": s.desc,
+                "idle": {
+                    "writes": IDLE_WRITES,
+                    "retained": idle.retained,
+                    "retained_alone": idle.retained_alone,
+                    "blocks": idle.blocks(),
+                },
+                "results": results,
+            })
         })
         .collect();
     let groups: Vec<Value> = GROUPS

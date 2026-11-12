@@ -115,8 +115,15 @@ Not included:
   fastest.
 - The writer in `read-writer` publishes continuously, and the readers in
   `write` read continuously. Both are far from a typical "read mostly" load.
-- Readers here release access right after every read. Nothing measures a
-  reader that holds a guard for a long time.
+- Readers here release access right after every read. Nothing measures the
+  cost of a reader that holds a guard for a long time.
+- `report` does check what a reader that has gone *idle* holds back: one
+  reader reads once and then does nothing, the writer publishes 100,000
+  values, and the allocations still alive afterwards are counted (and counted
+  again with the reader gone before the writes, as a control). Subjects where
+  the idle reader blocks collection (`local-rcu-cached`, `read-copy-update`)
+  are marked with ◆ on the results page and listed under "Idle readers" in
+  the markdown report.
 - All threads are unpinned and results depend on the machine. Compare columns
   within one run only.
 

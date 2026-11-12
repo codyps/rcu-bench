@@ -126,7 +126,10 @@ Not included:
   writes, as a control). Next to the allocations it counts the old values
   themselves, by searching the memory of every live allocation for them
   (freed memory is wiped): a subject may need several allocations to keep
-  one value, or none for a value stored in place. On the results page ◆ marks subjects where the idle
+  one value, or none for a value stored in place. Every one of these
+  measurements runs in a process of its own, because several subjects keep
+  a collector for the whole process, with whatever the previous measurement
+  left in it. On the results page ◆ marks subjects where the idle
   reader keeps every value since its read alive (`local-rcu-cached`,
   `read-copy-update`), and ◇ those where it keeps only the value it read
   (`arc-swap-cache`, `hazarc-cache`, `arcshift`). The markdown report lists

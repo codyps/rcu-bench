@@ -3,14 +3,15 @@
 //!
 //! Usage: `cargo run --release --bin report [--json] [criterion-dir]`
 //!
-//! It also measures, right here, what an idle reader does to each subject: see [`idle`].
+//! It also measures what an idle reader, and an idle writer, do to each subject: see
+//! [`left_after_writes`]. Each of those measurements runs in a process of its own.
 
 use rcu_bench::{for_each_subject, Subject, Val};
 use serde_json::{json, Value};
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::time::Duration;
@@ -414,23 +415,73 @@ fn left_after_writes<S: Subject>(stays: bool) -> Left {
     }
 }
 
-fn idle<S: Subject>() -> Idle {
-    Idle {
-        alone: left_after_writes::<S>(false),
-        idle: left_after_writes::<S>(true),
-    }
-}
+/// The argument that makes this program run one probe and print its result, instead of
+/// writing a report: `--probe <subject> <idle|alone>`.
+const PROBE_ARG: &str = "--probe";
 
-/// [`idle`] for every subject, in the order of [`rcu_bench::subjects`].
-fn idle_all() -> Vec<Idle> {
-    let mut all = Vec::new();
+/// Runs one probe in this process and prints the result as JSON.
+fn probe_here(subject: &str, stays: bool) {
+    let mut left = None;
     macro_rules! one {
         ($t:ty) => {
-            all.push(idle::<$t>());
+            if <$t as Subject>::NAME == subject {
+                left = Some(left_after_writes::<$t>(stays));
+            }
         };
     }
     for_each_subject!(one);
-    all
+    let Some(left) = left else {
+        eprintln!("no subject called {subject}");
+        std::process::exit(2);
+    };
+    println!(
+        "{}",
+        json!({
+            "retained": left.retained,
+            "read_value": left.read_value,
+            "retained_later": left.retained_later,
+            "values": left.values,
+        })
+    );
+}
+
+/// Runs one probe in a process of its own.
+///
+/// Several subjects keep state for the whole process: a global collector or domain, with the
+/// old values it has not freed yet. In one process, each probe would start with whatever the
+/// probes before it left there, and count some of it as its own (or free it, and come out with
+/// fewer allocations than it started with).
+fn probe(subject: &str, stays: bool) -> Left {
+    let exe = std::env::current_exe().expect("path of this program");
+    let out = Command::new(exe)
+        .args([PROBE_ARG, subject, if stays { "idle" } else { "alone" }])
+        .stderr(Stdio::inherit())
+        .output()
+        .expect("run the probe");
+    assert!(
+        out.status.success(),
+        "probe of {subject} failed: {}",
+        out.status
+    );
+    let v: Value = serde_json::from_slice(&out.stdout).expect("probe output");
+    let count = |k: &str| v[k].as_u64().expect("probe output");
+    Left {
+        retained: count("retained"),
+        read_value: count("read_value"),
+        retained_later: count("retained_later"),
+        values: v["values"].as_u64(),
+    }
+}
+
+/// What an idle reader does to every subject, in the order of [`rcu_bench::subjects`].
+fn idle_all() -> Vec<Idle> {
+    rcu_bench::subjects()
+        .iter()
+        .map(|s| Idle {
+            alone: probe(s.name, false),
+            idle: probe(s.name, true),
+        })
+        .collect()
 }
 
 /// (id, title, what is running, what is reported)
@@ -657,6 +708,16 @@ fn json(dir: &Path) -> bool {
 }
 
 fn main() {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().is_some_and(|a| a == PROBE_ARG) {
+        let [_, subject, case] = args.as_slice() else {
+            eprintln!("usage: report {PROBE_ARG} <subject> <idle|alone>");
+            std::process::exit(2);
+        };
+        probe_here(subject, case == "idle");
+        return;
+    }
+
     let mut as_json = false;
     let mut dir = PathBuf::from("target/criterion");
     for arg in std::env::args_os().skip(1) {

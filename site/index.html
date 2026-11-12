@@ -260,7 +260,8 @@ ul.caveats li { margin-bottom: 4px; }
         It is measured, not declared: the writer publishes a value, one reader reads it and then does nothing, and the writer
         publishes 100,000 more. Two things are counted afterwards: the allocations made by those writes that are still alive, and
         the old values that can still be found in memory the subject holds (freed memory is wiped). The marks go by the
-        allocations; a subject may need more than one per value it keeps, so the two counts differ. <span class="hold">◆</span>: most of those are still allocated afterwards, and would not be had the
+        allocations; a subject may need more than one per value it keeps, so the two counts differ. Each measurement runs in a
+        process of its own, so that a subject with a process-wide collector starts empty. <span class="hold">◆</span>: most of those are still allocated afterwards, and would not be had the
         reader gone away first. <span class="hold">◇</span>: only the value the reader read is still allocated, typically because
         the reader holds an <code>Arc</code> of it. <code>local-rcu-cached</code> is ◆ by design (call <code>release()</code>
         before going idle); plain <code>local-rcu</code> keeps nothing.</li>

@@ -86,7 +86,7 @@ and whatever the crate does about the old one.
 | `keepcalm-rcu` | `keepcalm` | `SharedMut::new_rcu`, `read`, `set` |
 | `crossbeam-epoch` | `crossbeam-epoch` | `Atomic<T>` in the global collector; `pin` per read, `defer_destroy` per write |
 | `seize` | `seize` | `AtomicPtr` + a `Collector`; `enter` + `protect` per read, `retire` per write |
-| `sdd` | `sdd` | `AtomicOwned`; a `Guard` per read, `swap` per write |
+| `sdd` | `sdd` | `AtomicOwned`; a `Guard` per read, a `Guard` and a `swap` per write (a thread only frees what it retired when it creates guards) |
 | `haphazard` | `haphazard` | `AtomicPtr`, one `HazardPointer` kept per reader; `retire` per write |
 | `kovan` | `kovan` | `Atom::load`, `store` |
 
@@ -138,7 +138,7 @@ Not included:
   writer publishes 100,000 values and stops. Subjects that still have a batch
   of old values allocated then (8 or more, short of all of them) are marked ≡
   on the page: `local-rcu-batched`, `swmr-cell`, `crossbeam-epoch`,
-  `haphazard`, `kovan`. The count is repeated after 200 ms of nothing
+  `sdd`, `haphazard`, `kovan`. The count is repeated after 200 ms of nothing
   happening, to tell apart subjects where a background task does the freeing
   (↻). None of the subjects has one as used here.
 - All threads are unpinned and results depend on the machine. Compare columns

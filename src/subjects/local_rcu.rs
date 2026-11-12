@@ -25,3 +25,31 @@ impl Subject for LocalRcu {
         drop(w.write(Box::new(v)));
     }
 }
+
+/// `cached::CachedReader`: stays in its read section between reads.
+pub struct LocalRcuCached;
+
+impl Subject for LocalRcuCached {
+    const NAME: &'static str = "local-rcu-cached";
+    const KIND: Kind = Kind::SingleWriter;
+    const DESC: &'static str =
+        "cached::CachedReader::read (stays in its read section between reads), Writer::write.";
+    type Writer = ::local_rcu::Writer<Val>;
+    type Reader = ::local_rcu::cached::CachedReader<Val>;
+
+    fn new(init: Val, readers: usize) -> (Self::Writer, Vec<Self::Reader>) {
+        let w = ::local_rcu::Writer::new(Box::new(init));
+        let rs = (0..readers).map(|_| w.reader().into()).collect();
+        (w, rs)
+    }
+
+    #[inline]
+    fn read(r: &mut Self::Reader) -> u64 {
+        r.read().get()
+    }
+
+    #[inline]
+    fn write(w: &mut Self::Writer, v: Val) {
+        drop(w.write(Box::new(v)));
+    }
+}

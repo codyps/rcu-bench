@@ -405,8 +405,7 @@ checksum = "65cd87c9a6d60536580b316ad985726104730a5151c99845f2490428ef91240a"
 [[package]]
 name = "local-rcu"
 version = "1.0.8"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6e2e62ac8fe9d89aa0d419c8180f69b06bf1f8514e1f1a7d76bfd01a68e7fd38"
+source = "git+https://github.com/codyps/local-rcu?rev=2063b76690f7cb9d57236b73ebf590cd3456e2af#2063b76690f7cb9d57236b73ebf590cd3456e2af"
 dependencies = [
  "loom 0.7.3",
  "slab",

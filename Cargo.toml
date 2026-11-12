@@ -6,7 +6,9 @@ publish = false
 description = "Benchmarks comparing Rust RCU-like single-value cells"
 
 [dependencies]
-local-rcu = "1.0.8"
+# Unreleased: `cached::CachedReader` from https://github.com/codyps/local-rcu/pull/15.
+# Switch back to a crates.io version once it is released.
+local-rcu = { git = "https://github.com/codyps/local-rcu", rev = "2063b76690f7cb9d57236b73ebf590cd3456e2af" }
 
 aarc = "0.4.0"
 arc-swap = "1.9.5"

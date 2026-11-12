@@ -1,30 +1,40 @@
-//! Read and write latency of every subject, alone and under contention.
+//! Read and write latency of every subject as the number of simultaneous readers grows.
 //!
-//! Groups (`N` is `RCU_BENCH_READERS`, default 4):
+//! Groups, each measured for a range of reader counts `R`:
 //!
-//! - `read-1`:        one reader, nothing else running
-//! - `read-N`:        N readers at once, no writer
-//! - `read-1-writer`: one reader, while a writer publishes as fast as it can
-//! - `read-N-writer`: N readers, while a writer publishes as fast as it can
-//! - `write-0`:       the writer alone
-//! - `write-N`:       the writer, while N readers read as fast as they can
+//! - `read`:        R readers, no writer
+//! - `read-writer`: R readers, while a writer publishes as fast as it can
+//! - `write`:       the writer, while R readers read as fast as they can (R starts at 0)
+//!
+//! Benchmark ids are `<group>/<subject>/<R>`.
+//!
+//! `RCU_BENCH_MAX_READERS` caps R. By default it is the number of CPUs (at most 8). The
+//! groups with a writer stop one short of the cap, so that the writer has a CPU of its own.
 //!
 //! Read groups report the time per read as seen by one reader (averaged over the readers).
-//! Write groups report the time per write.
+//! The write group reports the time per write.
 
 use criterion::measurement::WallTime;
-use criterion::{criterion_group, criterion_main, BenchmarkGroup, Criterion};
+use criterion::{criterion_group, criterion_main, BenchmarkGroup, BenchmarkId, Criterion};
 use rcu_bench::{for_each_subject, Subject, Val};
 use std::hint::black_box;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Barrier};
 use std::time::{Duration, Instant};
 
-fn n_readers() -> usize {
-    std::env::var("RCU_BENCH_READERS")
-        .ok()
-        .map(|v| v.parse().expect("RCU_BENCH_READERS must be a number"))
-        .unwrap_or(4)
+fn max_readers() -> usize {
+    match std::env::var("RCU_BENCH_MAX_READERS") {
+        Ok(v) => v.parse().expect("RCU_BENCH_MAX_READERS must be a number"),
+        Err(_) => std::thread::available_parallelism().map_or(4, |n| n.get().min(8)),
+    }
+}
+
+/// The reader counts to measure, up to and including `limit`.
+fn reader_counts(limit: usize) -> Vec<usize> {
+    [1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64]
+        .into_iter()
+        .filter(|&r| r <= limit)
+        .collect()
 }
 
 /// `readers` threads each do `iters` reads. Returns the mean time one reader took.
@@ -110,40 +120,44 @@ fn run_write<S: Subject>(iters: u64, readers: usize) -> Duration {
     elapsed
 }
 
-fn read_one<S: Subject>(g: &mut BenchmarkGroup<'_, WallTime>, readers: usize, with_writer: bool) {
-    if readers > S::MAX_READERS {
-        return;
+fn read_one<S: Subject>(g: &mut BenchmarkGroup<'_, WallTime>, counts: &[usize], with_writer: bool) {
+    for &readers in counts {
+        if readers > S::MAX_READERS {
+            continue;
+        }
+        g.bench_function(BenchmarkId::new(S::NAME, readers), |b| {
+            b.iter_custom(|iters| run_read::<S>(iters, readers, with_writer))
+        });
     }
-    g.bench_function(S::NAME, |b| {
-        b.iter_custom(|iters| run_read::<S>(iters, readers, with_writer))
-    });
 }
 
-fn write_one<S: Subject>(g: &mut BenchmarkGroup<'_, WallTime>, readers: usize) {
-    if readers > S::MAX_READERS {
-        return;
+fn write_one<S: Subject>(g: &mut BenchmarkGroup<'_, WallTime>, counts: &[usize]) {
+    for &readers in counts {
+        if readers > S::MAX_READERS {
+            continue;
+        }
+        g.bench_function(BenchmarkId::new(S::NAME, readers), |b| {
+            b.iter_custom(|iters| run_write::<S>(iters, readers))
+        });
     }
-    g.bench_function(S::NAME, |b| {
-        b.iter_custom(|iters| run_write::<S>(iters, readers))
-    });
 }
 
-fn read_group(c: &mut Criterion, name: &str, readers: usize, with_writer: bool) {
+fn read_group(c: &mut Criterion, name: &str, counts: &[usize], with_writer: bool) {
     let mut g = c.benchmark_group(name);
     macro_rules! one {
         ($t:ty) => {
-            read_one::<$t>(&mut g, readers, with_writer);
+            read_one::<$t>(&mut g, counts, with_writer);
         };
     }
     for_each_subject!(one);
     g.finish();
 }
 
-fn write_group(c: &mut Criterion, name: &str, readers: usize) {
+fn write_group(c: &mut Criterion, name: &str, counts: &[usize]) {
     let mut g = c.benchmark_group(name);
     macro_rules! one {
         ($t:ty) => {
-            write_one::<$t>(&mut g, readers);
+            write_one::<$t>(&mut g, counts);
         };
     }
     for_each_subject!(one);
@@ -151,21 +165,23 @@ fn write_group(c: &mut Criterion, name: &str, readers: usize) {
 }
 
 fn benches(c: &mut Criterion) {
-    let n = n_readers();
-    read_group(c, "read-1", 1, false);
-    read_group(c, "read-N", n, false);
-    read_group(c, "read-1-writer", 1, true);
-    read_group(c, "read-N-writer", n, true);
-    write_group(c, "write-0", 0);
-    write_group(c, "write-N", n);
+    let max = max_readers().max(2);
+    let alone = reader_counts(max);
+    let beside_writer = reader_counts(max - 1);
+    let mut for_write = vec![0];
+    for_write.extend(&beside_writer);
+
+    read_group(c, "read", &alone, false);
+    read_group(c, "read-writer", &beside_writer, true);
+    write_group(c, "write", &for_write);
 }
 
 criterion_group! {
     name = cells;
     config = Criterion::default()
         .sample_size(20)
-        .warm_up_time(Duration::from_millis(500))
-        .measurement_time(Duration::from_secs(2));
+        .warm_up_time(Duration::from_millis(400))
+        .measurement_time(Duration::from_millis(1500));
     targets = benches
 }
 criterion_main!(cells);

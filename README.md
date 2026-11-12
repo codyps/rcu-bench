@@ -9,19 +9,21 @@ For what each crate does and how they differ in design, see
 [`COMPARISONS.md`](https://github.com/codyps/local-rcu/blob/main/COMPARISONS.md)
 in `local-rcu`.
 
-**Results: <https://codyps.github.io/rcu-bench/>** (interactive; rerun by CI on
-every push and weekly). A snapshot from one laptop is in
-[`RESULTS.md`](RESULTS.md).
+**Results: <https://codyps.github.io/rcu-bench/>** (interactive; measured by CI
+on x86_64 and arm64, on every push and weekly).
 
 ## Running
 
 ```sh
 cargo test --release                   # check that every adapter behaves like a cell
-cargo bench                            # run everything (about 10 minutes)
-cargo bench -- 'read-N-writer/'        # one group
-cargo bench -- '/local-rcu$'           # one subject
-cargo run --release --bin report       # markdown table from target/criterion
+cargo bench                            # run everything
+cargo bench -- '^read-writer/'         # one group
+cargo bench -- '/local-rcu/'           # one subject
+cargo run --release --bin report       # markdown tables from target/criterion
 ```
+
+`RCU_BENCH_MAX_READERS` caps the number of reader threads. By default it is
+the number of CPUs, at most 8.
 
 To look at your own run in the results page:
 
@@ -30,22 +32,23 @@ cargo run --release --bin report -- --json > site/results.json
 python3 -m http.server --directory site   # then open http://localhost:8000
 ```
 
-`RCU_BENCH_READERS` sets the number of reader threads `N` (default 4).
-
 ## What is measured
 
 Every crate is wrapped in a `Subject` (see [`src/lib.rs`](src/lib.rs)), which
 reduces it to: create a cell with some reader handles, read the current value,
 publish a new value. The value is four `u64`s.
 
+Each group is measured for a range of reader counts `R` (1, 2, 3, 4, 6, 8, ...
+up to the cap), so the results show how each subject scales:
+
 | Group | Threads | Reported |
 |---|---|---|
-| `read-1` | one reader | time per read |
-| `read-N` | N readers | time per read, as seen by one reader |
-| `read-1-writer` | one reader + a writer publishing as fast as it can | time per read |
-| `read-N-writer` | N readers + a writer publishing as fast as it can | time per read, as seen by one reader |
-| `write-0` | the writer alone | time per write |
-| `write-N` | the writer + N readers reading as fast as they can | time per write |
+| `read` | R readers | time per read, as seen by one reader |
+| `read-writer` | R readers + a writer publishing as fast as it can | time per read, as seen by one reader |
+| `write` | the writer + R readers reading as fast as they can (R starts at 0) | time per write |
+
+The groups with a writer stop one reader short of the cap, so the writer has a
+CPU of its own.
 
 A read includes getting access (guard, lock, `Arc` clone, ...), looking at the
 value, and releasing access again. A write includes allocating the new value
@@ -61,7 +64,7 @@ and whatever the crate does about the old one.
 | `std-rwlock-arc` | std | `RwLock<Arc<T>>`, clone the `Arc` under the lock |
 | `std-mutex-arc` | std | `Mutex<Arc<T>>`, clone the `Arc` under the lock |
 | `tokio-watch` | `tokio` | `Receiver::borrow`, `Sender::send_replace` |
-| `triple_buffer` | `triple_buffer` | `Output::read`, `Input::write`. One reader only, so it is absent from the `N` groups |
+| `triple_buffer` | `triple_buffer` | `Output::read`, `Input::write`. One reader only, so it has no results above R = 1 |
 | `left-right` | `left-right` | the value is the data structure, the only operation replaces it; `append` + `publish` per write |
 | `swmr-cell` | `swmr-cell` | `LocalReader::pin`, `SwmrCell::store` |
 | `swmr-cell-read-preferred` | `swmr-cell` | the same, built with `read_preferred()` |
@@ -109,8 +112,8 @@ Not included:
   some let a slow reader block the writer. The adapters use each crate the way
   its documentation suggests for this job, not the way that happens to be
   fastest.
-- The writer in the `-writer` groups publishes continuously, which is the
-  worst case for readers and far from a typical "read mostly" load.
+- The writer in `read-writer` publishes continuously, and the readers in
+  `write` read continuously. Both are far from a typical "read mostly" load.
 - Readers here release access right after every read. Nothing measures a
   reader that holds a guard for a long time.
 - All threads are unpinned and results depend on the machine. Compare columns
@@ -119,10 +122,18 @@ Not included:
 ## CI
 
 [`.github/workflows/bench.yml`](.github/workflows/bench.yml) runs the smoke
-tests and the benchmarks, then publishes [`site/`](site) with a fresh
-`results.json` to GitHub Pages. GitHub-hosted runners have 4 cores and noisy
-neighbours, so CI uses `N` = 2 readers and its numbers are rougher than a run
-on a quiet machine.
+tests and the benchmarks on GitHub-hosted x86_64 and arm64 runners, merges the
+runs with [`scripts/merge_results.py`](scripts/merge_results.py), and publishes
+[`site/`](site) to GitHub Pages. The page has a machine switch.
+
+Those runners have 4 CPUs and noisy neighbours, so the sweep is short (up to 4
+readers alone, 3 beside a writer) and the numbers are rougher than a run on a
+quiet machine.
+
+To add a self-hosted machine, register a runner for this repository and set the
+repository variable `EXTRA_RUNNER` to its `runs-on` label (and optionally
+`EXTRA_RUNNER_NAME` to the name the page should show). The workflow only runs
+on pushes to `main`, on a schedule and by hand, never for pull requests.
 
 ## Adding a subject
 

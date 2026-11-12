@@ -124,6 +124,27 @@ button:focus-visible, [tabindex]:focus-visible, th button:focus-visible { outlin
 #tip dd { margin: 0; font-variant-numeric: tabular-nums; }
 #tip .t-desc { margin: 8px 0 0; color: var(--ink-2); border-top: 1px solid var(--border); padding-top: 8px; }
 
+.card + .card { margin-top: 16px; }
+#scaling { position: relative; }
+#scaling svg { display: block; width: 100%; overflow: visible; touch-action: pan-y; }
+#scaling text { font: 12.5px system-ui, -apple-system, "Segoe UI", sans-serif; fill: var(--ink-2); }
+#scaling .tick { fill: var(--muted); font-size: 11.5px; font-variant-numeric: tabular-nums; }
+#scaling .axis-title { fill: var(--muted); font-size: 11.5px; }
+#scaling .grid { stroke: var(--grid); stroke-width: 1; }
+#scaling .base { stroke: var(--axis); stroke-width: 1; }
+#scaling .cur { stroke: var(--ink-2); stroke-width: 1; }
+#scaling .line { fill: none; stroke-width: 1.5; stroke-linejoin: round; stroke-linecap: round; opacity: 0.38; }
+#scaling .line.strong { stroke-width: 2.5; opacity: 1; }
+#scaling.dim .line:not(.strong) { opacity: 0.14; }
+#scaling .dot { stroke: var(--surface); stroke-width: 2; }
+#scaling .endlabel { fill: var(--ink); }
+#scaling .endlabel.self { font-weight: 700; }
+#scaling .hit { fill: transparent; cursor: pointer; }
+#tip table { margin: 8px 0 0; width: 100%; font-size: 12.5px; }
+#tip th, #tip td { padding: 1px 0 1px 12px; border: 0; position: static; background: none; min-width: 0; }
+#tip th:first-child, #tip td:first-child { padding-left: 0; color: var(--muted); font-weight: 400; }
+#tip tr.cur td { font-weight: 650; color: var(--ink); }
+
 .tablewrap { overflow-x: auto; }
 table { border-collapse: collapse; width: 100%; font-size: 13px; }
 th, td { padding: 6px 8px; text-align: right; white-space: nowrap; border-bottom: 1px solid var(--grid); }
@@ -166,9 +187,17 @@ ul.caveats li { margin-bottom: 4px; }
 
   <div id="app" hidden>
     <div class="controls">
+      <div class="control" id="ctl-machine" hidden>
+        <span id="lbl-machine">Machine</span>
+        <div class="seg" id="machines" role="group" aria-labelledby="lbl-machine"></div>
+      </div>
       <div class="control">
-        <span id="lbl-scenario">Scenario</span>
-        <div class="seg" id="scenarios" role="group" aria-labelledby="lbl-scenario"></div>
+        <span id="lbl-op">Operation</span>
+        <div class="seg" id="ops" role="group" aria-labelledby="lbl-op"></div>
+      </div>
+      <div class="control">
+        <span id="lbl-readers">Simultaneous readers</span>
+        <div class="seg" id="readers" role="group" aria-labelledby="lbl-readers"></div>
       </div>
       <div class="control">
         <span id="lbl-scale">Scale</span>
@@ -191,20 +220,36 @@ ul.caveats li { margin-bottom: 4px; }
       <p class="note" id="chart-note"></p>
     </section>
 
-    <h2 id="table-title">All scenarios</h2>
-    <p class="lede">Median time per operation. Click a column to sort by it, click a row to pin it in the chart.</p>
+    <section class="card" aria-labelledby="scaling-title">
+      <div class="card-head">
+        <div>
+          <h3 id="scaling-title"></h3>
+          <p id="scaling-desc"></p>
+        </div>
+        <div class="seg" id="modes" role="group" aria-label="What the vertical axis shows">
+          <button type="button" data-mode="abs">Time per operation</button>
+          <button type="button" data-mode="rel">Relative to fewest readers</button>
+        </div>
+      </div>
+      <div id="scaling"></div>
+      <p class="note" id="scaling-note"></p>
+    </section>
+
+    <h2 id="table-title">All reader counts</h2>
+    <p class="lede">Median time per operation. Click a column to sort by it, click a row to pin it in the charts.</p>
     <section class="card" style="margin-top:12px">
       <div class="tablewrap"><table aria-labelledby="table-title"><thead></thead><tbody></tbody></table></div>
     </section>
 
     <h2>Reading these numbers</h2>
     <ul class="caveats">
-      <li>These are micro-benchmarks of the cell alone, run on a shared CI machine. Compare values within one run, not across runs.</li>
+      <li>These are micro-benchmarks of the cell alone, run on shared CI machines. Compare values within one machine and one run.</li>
       <li>The subjects do not offer the same guarantees. Some hand out borrows and others owned <code>Arc</code>s; some return old values
         to the writer and others drop them on a reader thread; some let a slow reader block the writer.
         <a href="https://github.com/codyps/local-rcu/blob/main/COMPARISONS.md">COMPARISONS.md</a> describes the differences.</li>
-      <li>The writer in the “+ writer” scenarios publishes continuously, and the readers in “Write, N readers” read continuously.
+      <li>The writer in “Read beside a writer” publishes continuously, and the readers in “Write” read continuously.
         Both are far harsher than a typical read-mostly workload.</li>
+      <li>The CI machines have 4 CPUs. Reads without a writer go up to 4 readers; with a writer the sweep stops at 3 so the writer has a CPU of its own.</li>
       <li>The range drawn around each dot on the log scale is criterion's 95% confidence interval for the median.</li>
       <li><code>baseline-leak</code> never frees anything. It is the floor, not a contender.</li>
     </ul>
@@ -224,11 +269,15 @@ const SELF = "local-rcu";
 const SVG = "http://www.w3.org/2000/svg";
 
 const state = {
-  data: null,
-  scenario: "read-N-writer",
+  runs: [],
+  run: 0,
+  op: "read-writer",
+  readers: null,
   scale: "log",
+  mode: "abs",
   hidden: new Set(),
   pinned: null,
+  hover: null,
   sort: { col: null, dir: 1 },
 };
 
@@ -246,6 +295,7 @@ function svg(tag, attrs, text) {
   return e;
 }
 const kindColor = (k) => `var(--k-${k})`;
+const kindLabel = (k) => (KINDS.find((x) => x.id === k) || {}).label || k;
 
 function fmt(ns) {
   if (ns >= 1e6) return (ns / 1e6).toFixed(ns >= 1e7 ? 0 : 1) + " ms";
@@ -266,50 +316,71 @@ function fmtTick(ns) {
   if (ns >= 1e3) return +(ns / 1e3).toPrecision(3) + " µs";
   return +ns.toPrecision(3) + " ns";
 }
-function groupTitle(g) {
-  return g.title.replace(/\bN\b/, state.data.meta.readers);
+const fmtRelTick = (v) => +v.toPrecision(3) + "×";
+const readersLabel = (r) => (r === 0 ? "no readers" : r === 1 ? "1 reader" : `${r} readers`);
+
+/* ---------- data access ---------- */
+const run = () => state.runs[state.run];
+const group = () => run().groups.find((g) => g.id === state.op);
+const series = (s, op) => s.results[op || state.op] || {};
+const result = (s, r) => series(s)[r == null ? state.readers : r];
+function counts(op) {
+  const set = new Set();
+  for (const s of run().subjects) for (const r in series(s, op)) set.add(+r);
+  return [...set].sort((a, b) => a - b);
 }
-function groupDesc(g) {
-  return g.desc.replace(/\bN\b/g, state.data.meta.readers);
+const machineLabel = (m) => m.label || m.arch || "run";
+function scenarioText() {
+  const g = group();
+  return g.desc.replace(/\bR readers\b/, readersLabel(state.readers)).replace("no readers read as fast as they can", "nobody reads");
 }
-const result = (s, gid) => s.results[gid || state.scenario];
 
 /* ---------- header ---------- */
 function renderMeta() {
-  const m = state.data.meta, ul = $("#meta");
+  const m = run().meta, ul = $("#meta");
+  ul.replaceChildren();
   const add = (label, value, href) => {
     if (!value) return;
     const li = el("li");
-    li.append(label + " ");
+    if (label) li.append(label + " ");
     const b = el("b", {}, value);
     if (href) { const a = el("a", { href }); a.append(b); li.append(a); } else li.append(b);
     ul.append(li);
   };
   add("Run", m.date);
-  add("CPU", m.cpu ? `${m.cpu}${m.threads ? ` (${m.threads} threads)` : ""}` : null);
-  add("N =", `${m.readers} readers`);
+  add("CPU", m.cpu ? `${m.cpu}${m.threads ? ` (${m.threads} threads)` : ""}` : (m.threads ? `${m.threads} threads` : null));
+  add("", m.arch);
   add("", m.rustc ? m.rustc.replace(/ \(.*/, "") : null);
   add("", m.os);
   if (m.commit && m.repository) add("Commit", m.commit.slice(0, 7), `https://github.com/${m.repository}/commit/${m.commit}`);
 }
 
 /* ---------- controls ---------- */
-function renderControls() {
-  const sc = $("#scenarios");
-  sc.replaceChildren();
-  for (const g of state.data.groups) {
-    const b = el("button", { type: "button", "aria-pressed": String(g.id === state.scenario) }, groupTitle(g));
-    b.addEventListener("click", () => { state.scenario = g.id; update(); });
-    sc.append(b);
+function seg(host, items, current, onPick) {
+  host.replaceChildren();
+  for (const it of items) {
+    const b = el("button", { type: "button", "aria-pressed": String(it.id === current) }, it.label);
+    b.addEventListener("click", () => onPick(it.id));
+    host.append(b);
   }
+}
+function renderControls() {
+  $("#ctl-machine").hidden = state.runs.length < 2;
+  seg($("#machines"), state.runs.map((r, i) => ({ id: i, label: machineLabel(r.meta) })), state.run, (i) => { state.run = i; normalize(); renderMeta(); update(); });
+  seg($("#ops"), run().groups.filter((g) => counts(g.id).length).map((g) => ({ id: g.id, label: g.title })), state.op, (id) => { state.op = id; normalize(); update(); });
+  seg($("#readers"), counts().map((r) => ({ id: r, label: String(r) })), state.readers, (r) => { state.readers = r; update(); });
   for (const b of document.querySelectorAll("#scales button")) {
     b.setAttribute("aria-pressed", String(b.dataset.scale === state.scale));
     b.onclick = () => { state.scale = b.dataset.scale; update(); };
   }
+  for (const b of document.querySelectorAll("#modes button")) {
+    b.setAttribute("aria-pressed", String(b.dataset.mode === state.mode));
+    b.onclick = () => { state.mode = b.dataset.mode; update(); };
+  }
   const lg = $("#legend");
   lg.replaceChildren();
   for (const k of KINDS) {
-    const n = state.data.subjects.filter((s) => s.kind === k.id).length;
+    const n = run().subjects.filter((s) => s.kind === k.id).length;
     if (!n) continue;
     const b = el("button", { type: "button", "aria-pressed": String(!state.hidden.has(k.id)) });
     const sw = el("span", { class: "swatch" });
@@ -322,13 +393,27 @@ function renderControls() {
     lg.append(b);
   }
 }
+/* keep the selection valid for the current machine */
+function normalize() {
+  if (!run().groups.some((g) => g.id === state.op && counts(g.id).length)) {
+    state.op = (run().groups.find((g) => counts(g.id).length) || run().groups[0]).id;
+  }
+  const c = counts();
+  if (!c.includes(state.readers)) {
+    const below = c.filter((r) => r <= (state.readers == null ? 4 : state.readers));
+    state.readers = below.length ? below[below.length - 1] : c[0];
+  }
+}
 
 /* ---------- scales ---------- */
 function logScale(min, max) {
-  const lo = Math.floor(Math.log10(min) + 1e-9), hi = Math.ceil(Math.log10(max) - 1e-9);
-  const a = lo, b = Math.max(hi, lo + 1);
+  const a = Math.floor(Math.log10(min) + 1e-9);
+  const b = Math.max(Math.ceil(Math.log10(max) - 1e-9), a + 1);
   const ticks = [];
-  for (let e = a; e <= b; e++) ticks.push(Math.pow(10, e));
+  for (let e = a; e <= b; e++) {
+    ticks.push({ v: Math.pow(10, e), major: true });
+    if (b - a <= 2 && e < b) for (const m of [2, 5]) ticks.push({ v: m * Math.pow(10, e), major: false });
+  }
   return { ticks, pos: (v) => (Math.log10(v) - a) / (b - a) };
 }
 function linearScale(max) {
@@ -336,17 +421,17 @@ function linearScale(max) {
   const step = [1, 2, 2.5, 5, 10].map((m) => m * mag).find((s) => s >= raw);
   const top = Math.ceil(max / step - 1e-9) * step;
   const ticks = [];
-  for (let v = 0; v <= top + step / 2; v += step) ticks.push(v);
+  for (let v = 0; v <= top + step / 2; v += step) ticks.push({ v, major: true });
   return { ticks, pos: (v) => v / top };
 }
 
-/* ---------- chart ---------- */
+/* ---------- ranked chart ---------- */
 function renderChart() {
-  const g = state.data.groups.find((x) => x.id === state.scenario);
-  $("#chart-title").textContent = `${groupTitle(g)}: time per ${g.op}`;
-  $("#chart-desc").textContent = groupDesc(g) + (state.scale === "log" ? " Log scale: each gridline is 10× the one before." : "");
+  const g = group();
+  $("#chart-title").textContent = `${g.title}, ${readersLabel(state.readers)}: time per ${g.op}`;
+  $("#chart-desc").textContent = scenarioText() + (state.scale === "log" ? " Log scale: each labelled gridline is 10× the one before." : "");
 
-  const all = state.data.subjects;
+  const all = run().subjects;
   const rows = all
     .filter((s) => result(s) && !state.hidden.has(s.kind))
     .sort((a, b) => result(a).median - result(b).median);
@@ -375,18 +460,16 @@ function renderChart() {
     : linearScale(Math.max(...rows.map((s) => result(s).median)));
   const x = (v) => plotX + Math.max(0, Math.min(1, scale.pos(v))) * plotW;
 
-  const root = svg("svg", { viewBox: `0 0 ${W} ${H}`, height: H, role: "list", "aria-label": `${groupTitle(g)}, sorted fastest first` });
+  const root = svg("svg", { viewBox: `0 0 ${W} ${H}`, height: H, role: "list", "aria-label": `${g.title}, ${readersLabel(state.readers)}, sorted fastest first` });
 
-  // axis
-  const maxTicks = Math.max(2, Math.floor(plotW / 62));
-  const every = Math.ceil(scale.ticks.length / maxTicks);
-  scale.ticks.forEach((t, i) => {
-    const tx = x(t);
+  const majors = scale.ticks.filter((t) => t.major);
+  const every = Math.ceil(majors.length / Math.max(2, Math.floor(plotW / 62)));
+  majors.forEach((t, i) => {
+    const tx = x(t.v);
     root.append(svg("line", { class: i === 0 && state.scale === "linear" ? "base" : "grid", x1: tx, x2: tx, y1: top - 6, y2: H - 6 }));
-    if (i % every === 0) root.append(svg("text", { class: "tick", x: tx, y: top - 12, "text-anchor": "middle" }, fmtTick(t)));
+    if (i % every === 0) root.append(svg("text", { class: "tick", x: tx, y: top - 12, "text-anchor": "middle" }, fmtTick(t.v)));
   });
 
-  // reference line at local-rcu
   const selfShown = rows.some((s) => s.name === SELF);
   if (selfVal != null && selfShown) {
     const rx = x(selfVal);
@@ -402,8 +485,7 @@ function renderChart() {
       "aria-label": `${s.name}: ${fmt(r.median)}` + (ratio && s.name !== SELF ? `, ${fmtRatio(ratio)} local-rcu` : ""),
     });
     row.append(svg("rect", { class: "bg", x: 0, y: y + 1, width: W, height: rowH - 2, rx: 5 }));
-    const name = svg("text", { class: "name" + (s.name === SELF ? " self" : ""), x: labelW, y: cy + 4, "text-anchor": "end" }, s.name);
-    row.append(name);
+    row.append(svg("text", { class: "name" + (s.name === SELF ? " self" : ""), x: labelW, y: cy + 4, "text-anchor": "end" }, s.name));
 
     if (state.scale === "log") {
       const x1 = x(r.lo), x2 = x(r.hi);
@@ -411,7 +493,6 @@ function renderChart() {
       row.append(svg("circle", { class: "dot", cx: x(r.median), cy, r: 6, fill: kindColor(s.kind) }));
     } else {
       const w = Math.max(1.5, x(r.median) - plotX), h = 12, rad = Math.min(4, w);
-      // square at the baseline, rounded at the data end
       const d = `M${plotX},${cy - h / 2} h${w - rad} a${rad},${rad} 0 0 1 ${rad},${rad} v${h - 2 * rad} a${rad},${rad} 0 0 1 ${-rad},${rad} h${-(w - rad)} z`;
       row.append(svg("path", { d, fill: kindColor(s.kind) }));
     }
@@ -424,48 +505,154 @@ function renderChart() {
       row.append(svg("text", { class: "val", x: narrow ? vx : vx - 58, y: cy + 4, "text-anchor": "end" }, fmt(r.median)));
     }
 
-    const show = (ev) => showTip(s, g, ratio, ev, row);
+    const show = (ev) => showRowTip(s, ratio, ev, row);
     row.addEventListener("pointermove", show);
     row.addEventListener("pointerleave", hideTip);
     row.addEventListener("focus", show);
     row.addEventListener("blur", hideTip);
-    const pin = () => { state.pinned = state.pinned === s.name ? null : s.name; update(); };
-    row.addEventListener("click", pin);
-    row.addEventListener("keydown", (ev) => { if (ev.key === "Enter" || ev.key === " ") { ev.preventDefault(); pin(); } });
+    row.addEventListener("click", () => togglePin(s.name));
+    row.addEventListener("keydown", (ev) => { if (ev.key === "Enter" || ev.key === " ") { ev.preventDefault(); togglePin(s.name); } });
     root.append(row);
   });
 
   if (!narrow) root.append(svg("text", { class: "tick", x: W - padR, y: top - 12, "text-anchor": "end" }, "vs local-rcu"));
   host.append(root);
-
-  // shrink names that do not fit their column
-  for (const t of root.querySelectorAll("text.name")) {
-    const len = t.getComputedTextLength();
-    if (len > labelW - 4) { t.setAttribute("textLength", labelW - 4); t.setAttribute("lengthAdjust", "spacingAndGlyphs"); }
-  }
+  fitNames(root, "text.name", labelW - 4);
 
   const notes = [];
   if (selfVal != null && selfShown) notes.push("The vertical line marks local-rcu.");
-  if (missing.length) notes.push(`Not in this scenario: ${missing.join(", ")} (it supports one reader only).`);
+  if (missing.length) notes.push(`Not measured here: ${missing.join(", ")}.`);
   $("#chart-note").textContent = notes.join(" ");
 }
+function fitNames(root, sel, max) {
+  for (const t of root.querySelectorAll(sel)) {
+    if (t.getComputedTextLength() > max) { t.setAttribute("textLength", max); t.setAttribute("lengthAdjust", "spacingAndGlyphs"); }
+  }
+}
+function togglePin(name) {
+  state.pinned = state.pinned === name ? null : name;
+  update();
+}
 
-/* ---------- tooltip ---------- */
-function showTip(s, g, ratio, ev, anchor) {
-  const r = result(s), tip = $("#tip");
+/* ---------- scaling chart ---------- */
+function renderScaling() {
+  const g = group(), cs = counts(), rel = state.mode === "rel";
+  const first = cs[0];
+  $("#scaling-title").textContent = `${g.title}: how the time per ${g.op} changes with the number of readers`;
+  $("#scaling-desc").textContent = rel
+    ? `Each line is one subject, divided by its own time with ${readersLabel(first)}. A flat line at 1× scales perfectly.`
+    : "Each line is one subject. A flat line scales perfectly; a rising line means readers get in each other's (or the writer's) way.";
+
+  const host = $("#scaling");
+  host.replaceChildren();
+  const lines = [];
+  for (const s of run().subjects) {
+    if (state.hidden.has(s.kind)) continue;
+    const ser = series(s);
+    const base = ser[first] ? ser[first].median : null;
+    const pts = cs.filter((r) => ser[r] && (!rel || base)).map((r) => ({ r, v: rel ? ser[r].median / base : ser[r].median, abs: ser[r].median }));
+    if (pts.length >= 2) lines.push({ s, pts });
+  }
+  if (cs.length < 2 || !lines.length) {
+    host.append(el("p", { class: "note" }, "Not enough reader counts were measured on this machine to draw a trend."));
+    $("#scaling-note").textContent = "";
+    return;
+  }
+
+  const W = Math.max(300, host.clientWidth);
+  const narrow = W < 560;
+  const padL = 58, padR = narrow ? 104 : 170, top = 16, plotH = narrow ? 300 : 380, bottom = 44;
+  const plotW = W - padL - padR, H = top + plotH + bottom;
+  const xs = (r) => padL + (cs.indexOf(r) / (cs.length - 1)) * plotW;
+
+  const vals = lines.flatMap((l) => l.pts.map((p) => p.v));
+  const scale = state.scale === "log" ? logScale(Math.min(...vals), Math.max(...vals)) : linearScale(Math.max(...vals));
+  const y = (v) => top + (1 - Math.max(0, Math.min(1, scale.pos(v)))) * plotH;
+  const tickFmt = rel ? fmtRelTick : fmtTick;
+
+  const root = svg("svg", { viewBox: `0 0 ${W} ${H}`, height: H, role: "img",
+    "aria-label": `${g.title}: time per ${g.op} against the number of readers, one line per subject. The table below has the same values.` });
+
+  const majors = scale.ticks.filter((t) => t.major).length;
+  scale.ticks.forEach((t, i) => {
+    const ty = y(t.v);
+    root.append(svg("line", { class: i === 0 && state.scale === "linear" ? "base" : "grid", x1: padL, x2: padL + plotW, y1: ty, y2: ty }));
+    if (t.major || majors <= 3) root.append(svg("text", { class: "tick", x: padL - 8, y: ty + 4, "text-anchor": "end" }, tickFmt(t.v)));
+  });
+  for (const r of cs) {
+    root.append(svg("text", { class: "tick", x: xs(r), y: top + plotH + 18, "text-anchor": "middle" }, String(r)));
+  }
+  root.append(svg("text", { class: "axis-title", x: padL + plotW / 2, y: top + plotH + 38, "text-anchor": "middle" }, "simultaneous readers"));
+  if (cs.includes(state.readers)) {
+    root.append(svg("line", { class: "cur", x1: xs(state.readers), x2: xs(state.readers), y1: top, y2: top + plotH }));
+  }
+
+  const strong = (name) => name === SELF || name === state.pinned || name === state.hover;
+  // weak lines first so the emphasised ones sit on top
+  const ordered = [...lines].sort((a, b) => strong(a.s.name) - strong(b.s.name));
+  for (const l of ordered) {
+    const d = l.pts.map((p, i) => `${i ? "L" : "M"}${xs(p.r).toFixed(1)},${y(p.v).toFixed(1)}`).join(" ");
+    const isStrong = strong(l.s.name);
+    root.append(svg("path", { class: "line" + (isStrong ? " strong" : ""), d, stroke: kindColor(l.s.kind) }));
+    if (isStrong) for (const p of l.pts) root.append(svg("circle", { class: "dot", cx: xs(p.r), cy: y(p.v), r: 4.5, fill: kindColor(l.s.kind) }));
+  }
+  host.classList.toggle("dim", !!(state.pinned || state.hover));
+
+  // direct labels for the emphasised lines only, nudged apart
+  const labels = ordered.filter((l) => strong(l.s.name)).map((l) => {
+    const p = l.pts[l.pts.length - 1];
+    return { l, x: xs(p.r) + 10, y: y(p.v) + 4 };
+  }).sort((a, b) => a.y - b.y);
+  for (let i = 1; i < labels.length; i++) if (labels[i].y - labels[i - 1].y < 15) labels[i].y = labels[i - 1].y + 15;
+  for (const lb of labels) {
+    root.append(svg("text", { class: "endlabel" + (lb.l.s.name === SELF ? " self" : ""), x: lb.x, y: lb.y }, lb.l.s.name));
+  }
+
+  // one hit layer: the pointer only has to be closest to a point
+  const hit = svg("rect", { class: "hit", x: padL - 12, y: top - 8, width: plotW + 24, height: plotH + 16, tabindex: 0,
+    "aria-label": "Move over the plot to inspect a subject, click to pin it" });
+  const nearest = (ev) => {
+    const b = root.getBoundingClientRect(), k = W / b.width;
+    const px = (ev.clientX - b.left) * k, py = (ev.clientY - b.top) * k;
+    let best = null, bd = Infinity;
+    for (const l of lines) for (const p of l.pts) {
+      const d = Math.hypot(xs(p.r) - px, y(p.v) - py);
+      if (d < bd) { bd = d; best = { l, p }; }
+    }
+    return bd < 60 ? best : null;
+  };
+  hit.addEventListener("pointermove", (ev) => {
+    const n = nearest(ev);
+    const name = n ? n.l.s.name : null;
+    if (name !== state.hover) { state.hover = name; renderScaling(); }
+    if (n) showLineTip(n.l, n.p.r, ev); else hideTip();
+  });
+  hit.addEventListener("pointerleave", () => { hideTip(); if (state.hover) { state.hover = null; renderScaling(); } });
+  hit.addEventListener("click", (ev) => { const n = nearest(ev); if (n) { state.hover = null; togglePin(n.l.s.name); } });
+  root.append(hit);
+  host.append(root);
+  fitNames(root, "text.endlabel", padR - 14);
+
+  const dropped = run().subjects.filter((s) => !state.hidden.has(s.kind) && !lines.some((l) => l.s === s)).map((s) => s.name);
+  const notes = ["local-rcu is always drawn in full. Point at a line for its numbers, click to pin it."];
+  if (dropped.length) notes.push(`No trend for: ${dropped.join(", ")} (fewer than two reader counts).`);
+  $("#scaling-note").textContent = notes.join(" ");
+}
+
+/* ---------- tooltips ---------- */
+function tipHead(s, text) {
+  const tip = $("#tip");
   tip.replaceChildren();
-  tip.append(el("div", { class: "t-val" }, `${fmt(r.median)} per ${g.op}`));
+  tip.append(el("div", { class: "t-val" }, text));
   const name = el("div", { class: "t-name" });
   const key = el("span", { class: "t-key" });
   key.style.background = kindColor(s.kind);
   name.append(key, s.name);
   tip.append(name);
-  const dl = el("dl");
-  const add = (k, v) => { dl.append(el("dt", {}, k), el("dd", {}, v)); };
-  add("95% CI", `${fmt(r.lo)} – ${fmt(r.hi)}`);
-  if (ratio && s.name !== SELF) add("vs local-rcu", ratio >= 1 ? `${fmtRatio(ratio)} slower` : `${fmtRatio(1 / ratio)} faster`);
-  add("Kind", (KINDS.find((k) => k.id === s.kind) || {}).label || s.kind);
-  tip.append(dl, el("p", { class: "t-desc" }, s.desc));
+  return tip;
+}
+function placeTip(ev, anchor) {
+  const tip = $("#tip");
   tip.style.display = "block";
   let px, py;
   if (ev && ev.clientX != null && ev.type !== "focus") { px = ev.clientX; py = ev.clientY; }
@@ -477,18 +664,43 @@ function showTip(s, g, ratio, ev, anchor) {
   tip.style.left = left + "px";
   tip.style.top = topPx + "px";
 }
+function showRowTip(s, ratio, ev, anchor) {
+  const r = result(s), g = group();
+  const tip = tipHead(s, `${fmt(r.median)} per ${g.op}`);
+  const dl = el("dl");
+  const add = (k, v) => { dl.append(el("dt", {}, k), el("dd", {}, v)); };
+  add("95% CI", `${fmt(r.lo)} – ${fmt(r.hi)}`);
+  if (ratio && s.name !== SELF) add("vs local-rcu", ratio >= 1 ? `${fmtRatio(ratio)} slower` : `${fmtRatio(1 / ratio)} faster`);
+  add("Kind", kindLabel(s.kind));
+  tip.append(dl, el("p", { class: "t-desc" }, s.desc));
+  placeTip(ev, anchor);
+}
+function showLineTip(l, r, ev) {
+  const g = group(), p = l.pts.find((x) => x.r === r), base = l.pts[0];
+  const tip = tipHead(l.s, `${fmt(p.abs)} per ${g.op} with ${readersLabel(r)}`);
+  const t = el("table"), tb = el("tbody");
+  for (const q of l.pts) {
+    const tr = el("tr");
+    if (q.r === r) tr.className = "cur";
+    tr.append(el("td", {}, readersLabel(q.r)), el("td", {}, fmt(q.abs)), el("td", {}, q === base ? "" : fmtRatio(q.abs / base.abs)));
+    tb.append(tr);
+  }
+  t.append(tb);
+  tip.append(t);
+  placeTip(ev, null);
+}
 function hideTip() { $("#tip").style.display = "none"; }
 
 /* ---------- table ---------- */
 function renderTable() {
-  const groups = state.data.groups;
+  const cs = counts();
   const thead = $("thead"), tbody = $("tbody");
   thead.replaceChildren();
   tbody.replaceChildren();
   const tr = el("tr");
   const mk = (label, col) => {
     const th = el("th", { scope: "col" });
-    if (col === state.scenario) th.className = "cur";
+    if (col === state.readers) th.className = "cur";
     if (state.sort.col === col) th.setAttribute("aria-sort", state.sort.dir > 0 ? "ascending" : "descending");
     const b = el("button", { type: "button" }, label + (state.sort.col === col ? (state.sort.dir > 0 ? " ▲" : " ▼") : ""));
     b.addEventListener("click", () => {
@@ -499,14 +711,15 @@ function renderTable() {
     tr.append(th);
   };
   mk("Subject", "name");
-  for (const g of groups) mk(groupTitle(g), g.id);
+  for (const r of cs) mk(readersLabel(r), r);
   thead.append(tr);
 
-  const subjects = state.data.subjects.filter((s) => !state.hidden.has(s.kind));
-  const col = state.sort.col || state.scenario, dir = state.sort.col ? state.sort.dir : 1;
+  const subjects = run().subjects.filter((s) => !state.hidden.has(s.kind));
+  const col = state.sort.col != null && (state.sort.col === "name" || cs.includes(state.sort.col)) ? state.sort.col : state.readers;
+  const dir = state.sort.col === col ? state.sort.dir : 1;
   subjects.sort((a, b) => {
     if (col === "name") return dir * a.name.localeCompare(b.name);
-    const av = a.results[col], bv = b.results[col];
+    const av = series(a)[col], bv = series(b)[col];
     if (!av || !bv) return (av ? -1 : 0) - (bv ? -1 : 0);
     return dir * (av.median - bv.median);
   });
@@ -514,58 +727,67 @@ function renderTable() {
     const row = el("tr");
     if (s.name === SELF) row.classList.add("self");
     if (s.name === state.pinned) row.classList.add("pinned");
-    const first = el("td");
+    const firstCell = el("td");
     const sw = el("span", { class: "swatch" });
     sw.style.background = kindColor(s.kind);
-    first.append(sw, s.name);
-    first.title = s.desc;
-    row.append(first);
-    for (const g of groups) {
-      const r = s.results[g.id];
-      const td = el("td", {}, r ? fmt(r.median) : "—");
-      if (!r) td.classList.add("none");
-      if (g.id === state.scenario) td.classList.add("cur");
+    firstCell.append(sw, s.name);
+    firstCell.title = s.desc;
+    row.append(firstCell);
+    for (const r of cs) {
+      const v = series(s)[r];
+      const td = el("td", {}, v ? fmt(v.median) : "—");
+      if (!v) td.classList.add("none");
+      if (r === state.readers) td.classList.add("cur");
       row.append(td);
     }
-    row.addEventListener("click", () => { state.pinned = state.pinned === s.name ? null : s.name; update(); });
+    row.addEventListener("click", () => togglePin(s.name));
     tbody.append(row);
   }
+  $("#table-title").textContent = `${group().title}: all reader counts`;
 }
 
 function update() {
   hideTip();
   renderControls();
   renderChart();
+  renderScaling();
   renderTable();
   const p = new URLSearchParams();
-  p.set("s", state.scenario);
+  if (state.runs.length > 1) p.set("m", machineLabel(run().meta));
+  p.set("op", state.op);
+  p.set("r", state.readers);
   if (state.scale !== "log") p.set("scale", state.scale);
+  if (state.mode !== "abs") p.set("y", state.mode);
   if (state.pinned) p.set("pin", state.pinned);
   history.replaceState(null, "", "#" + p.toString());
 }
 
 function restore() {
   const p = new URLSearchParams(location.hash.slice(1));
-  const s = p.get("s");
-  if (s && state.data.groups.some((g) => g.id === s)) state.scenario = s;
+  const m = state.runs.findIndex((r) => machineLabel(r.meta) === p.get("m"));
+  if (m >= 0) state.run = m;
+  if (p.get("op")) state.op = p.get("op");
+  if (p.get("r") != null && p.get("r") !== "") state.readers = +p.get("r");
   if (p.get("scale") === "linear") state.scale = "linear";
+  if (p.get("y") === "rel") state.mode = "rel";
   const pin = p.get("pin");
-  if (pin && state.data.subjects.some((x) => x.name === pin)) state.pinned = pin;
+  if (pin && run().subjects.some((x) => x.name === pin)) state.pinned = pin;
 }
 
 fetch("results.json", { cache: "no-cache" })
   .then((r) => { if (!r.ok) throw new Error(`results.json: HTTP ${r.status}`); return r.json(); })
   .then((data) => {
-    state.data = data;
-    if (!data.groups.some((g) => g.id === state.scenario)) state.scenario = data.groups[0].id;
+    state.runs = (data.runs || [data]).filter((r) => r && r.subjects);
+    if (!state.runs.length) throw new Error("results.json has no runs");
     restore();
+    normalize();
     renderMeta();
     $("#app").hidden = false;
     update();
     let w = $("#chart").clientWidth;
     new ResizeObserver(() => {
       const nw = $("#chart").clientWidth;
-      if (nw !== w) { w = nw; hideTip(); renderChart(); }
+      if (nw !== w) { w = nw; hideTip(); renderChart(); renderScaling(); }
     }).observe($("#chart"));
   })
   .catch((e) => {

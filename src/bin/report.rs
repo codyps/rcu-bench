@@ -1,57 +1,62 @@
-//! Turns criterion's output (`target/criterion`) into a markdown table, or into the JSON
+//! Turns criterion's output (`target/criterion`) into markdown tables, or into the JSON
 //! file the results page reads.
 //!
 //! Usage: `cargo run --release --bin report [--json] [criterion-dir]`
 
 use serde_json::{json, Value};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// (id, title, what is running, what is reported)
 const GROUPS: &[(&str, &str, &str, &str)] = &[
+    ("read", "Read", "R readers at once, no writer.", "read"),
     (
-        "read-1",
-        "Read, one reader",
-        "One reader, nothing else running.",
+        "read-writer",
+        "Read beside a writer",
+        "R readers, while a writer publishes as fast as it can.",
         "read",
     ),
     (
-        "read-N",
-        "Read, N readers",
-        "N readers at once, no writer.",
-        "read",
-    ),
-    (
-        "read-1-writer",
-        "Read, one reader + writer",
-        "One reader, while a writer publishes as fast as it can.",
-        "read",
-    ),
-    (
-        "read-N-writer",
-        "Read, N readers + writer",
-        "N readers, while a writer publishes as fast as it can.",
-        "read",
-    ),
-    ("write-0", "Write, no readers", "The writer alone.", "write"),
-    (
-        "write-N",
-        "Write, N readers",
-        "The writer, while N readers read as fast as they can.",
+        "write",
+        "Write",
+        "The writer, while R readers read as fast as they can.",
         "write",
     ),
 ];
 
 /// Median time per operation in nanoseconds, with its confidence interval.
-fn estimate(dir: &Path, group: &str, subject: &str) -> Option<(f64, f64, f64)> {
-    let path = dir.join(group).join(subject).join("new/estimates.json");
+struct Estimate {
+    median: f64,
+    lo: f64,
+    hi: f64,
+}
+
+fn estimate(path: &Path) -> Option<Estimate> {
     let json: Value = serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
     let m = &json["median"];
-    Some((
-        m["point_estimate"].as_f64()?,
-        m["confidence_interval"]["lower_bound"].as_f64()?,
-        m["confidence_interval"]["upper_bound"].as_f64()?,
-    ))
+    Some(Estimate {
+        median: m["point_estimate"].as_f64()?,
+        lo: m["confidence_interval"]["lower_bound"].as_f64()?,
+        hi: m["confidence_interval"]["upper_bound"].as_f64()?,
+    })
+}
+
+/// All results of one subject in one group, by reader count.
+fn estimates(dir: &Path, group: &str, subject: &str) -> BTreeMap<u32, Estimate> {
+    let mut all = BTreeMap::new();
+    let Ok(entries) = std::fs::read_dir(dir.join(group).join(subject)) else {
+        return all;
+    };
+    for entry in entries.flatten() {
+        let Some(readers) = entry.file_name().to_str().and_then(|n| n.parse().ok()) else {
+            continue;
+        };
+        if let Some(e) = estimate(&entry.path().join("new/estimates.json")) {
+            all.insert(readers, e);
+        }
+    }
+    all
 }
 
 fn fmt_ns(ns: f64) -> String {
@@ -75,33 +80,42 @@ fn command_output(cmd: &str, args: &[&str]) -> Option<String> {
 
 fn cpu_model() -> Option<String> {
     let info = std::fs::read_to_string("/proc/cpuinfo").ok()?;
-    let line = info.lines().find(|l| l.starts_with("model name"))?;
+    if let Some(line) = info.lines().find(|l| l.starts_with("model name")) {
+        return Some(line.split_once(':')?.1.trim().to_string());
+    }
+    // arm64 has no "model name"; lscpu knows how to decode the part number
+    let lscpu = command_output("lscpu", &[])?;
+    let line = lscpu.lines().find(|l| l.starts_with("Model name"))?;
     Some(line.split_once(':')?.1.trim().to_string())
 }
 
-fn readers() -> u64 {
-    std::env::var("RCU_BENCH_READERS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(4)
-}
-
 fn markdown(dir: &Path) -> bool {
-    let ids: Vec<_> = GROUPS.iter().map(|g| g.0).collect();
-    println!("| Subject | {} |", ids.join(" | "));
-    println!("|---|{}", "---:|".repeat(ids.len()));
     let mut found = false;
-    for subject in rcu_bench::subjects() {
-        let cells: Vec<_> = ids.iter().map(|g| estimate(dir, g, subject.name)).collect();
-        if cells.iter().all(Option::is_none) {
+    for g in GROUPS {
+        let rows: Vec<_> = rcu_bench::subjects()
+            .into_iter()
+            .map(|s| (s.name, estimates(dir, g.0, s.name)))
+            .filter(|(_, e)| !e.is_empty())
+            .collect();
+        let mut counts: Vec<u32> = rows.iter().flat_map(|(_, e)| e.keys().copied()).collect();
+        counts.sort_unstable();
+        counts.dedup();
+        if counts.is_empty() {
             continue;
         }
         found = true;
-        let cells: Vec<_> = cells
-            .into_iter()
-            .map(|c| c.map(|c| fmt_ns(c.0)).unwrap_or_else(|| "—".into()))
-            .collect();
-        println!("| `{}` | {} |", subject.name, cells.join(" | "));
+        println!("### {}\n\n{} Time per {}.\n", g.1, g.2, g.3);
+        let head: Vec<_> = counts.iter().map(|c| format!("R = {c}")).collect();
+        println!("| Subject | {} |", head.join(" | "));
+        println!("|---|{}", "---:|".repeat(counts.len()));
+        for (name, e) in rows {
+            let cells: Vec<_> = counts
+                .iter()
+                .map(|c| e.get(c).map_or("—".into(), |e| fmt_ns(e.median)))
+                .collect();
+            println!("| `{name}` | {} |", cells.join(" | "));
+        }
+        println!();
     }
     found
 }
@@ -113,9 +127,18 @@ fn json(dir: &Path) -> bool {
         .map(|s| {
             let mut results = serde_json::Map::new();
             for g in GROUPS {
-                if let Some((median, lo, hi)) = estimate(dir, g.0, s.name) {
+                let by_readers: serde_json::Map<_, _> = estimates(dir, g.0, s.name)
+                    .into_iter()
+                    .map(|(r, e)| {
+                        (
+                            r.to_string(),
+                            json!({ "median": e.median, "lo": e.lo, "hi": e.hi }),
+                        )
+                    })
+                    .collect();
+                if !by_readers.is_empty() {
                     found = true;
-                    results.insert(g.0.into(), json!({ "median": median, "lo": lo, "hi": hi }));
+                    results.insert(g.0.into(), by_readers.into());
                 }
             }
             json!({ "name": s.name, "kind": s.kind.id(), "desc": s.desc, "results": results })
@@ -127,6 +150,8 @@ fn json(dir: &Path) -> bool {
         .collect();
     let doc = json!({
         "meta": {
+            "label": std::env::var("BENCH_MACHINE").ok(),
+            "arch": std::env::consts::ARCH,
             "date": command_output("date", &["-u", "+%Y-%m-%d %H:%M UTC"]),
             "commit": std::env::var("GITHUB_SHA").ok(),
             "repository": std::env::var("GITHUB_REPOSITORY").ok(),
@@ -134,7 +159,6 @@ fn json(dir: &Path) -> bool {
             "cpu": cpu_model(),
             "threads": std::thread::available_parallelism().ok().map(|n| n.get()),
             "os": command_output("uname", &["-sr"]),
-            "readers": readers(),
         },
         "groups": groups,
         "subjects": subjects,

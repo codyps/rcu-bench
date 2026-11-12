@@ -28,12 +28,133 @@ static WATCHING: AtomicBool = AtomicBool::new(false);
 /// Addresses of the watched allocations that have not been freed yet (0: empty slot).
 static WATCHED: [AtomicUsize; 64] = [const { AtomicUsize::new(0) }; 64];
 
+/// While set, every allocation is entered in [`TRACKED`], and freed memory is wiped.
+static TRACK: AtomicBool = AtomicBool::new(false);
+/// Whether [`TRACKED`] may hold anything, so that frees can skip it otherwise.
+static TRACKING: AtomicBool = AtomicBool::new(false);
+/// Set when [`TRACKED`] ran out of room: what it says can't be trusted.
+static TRACK_OVERFLOW: AtomicBool = AtomicBool::new(false);
+
+const TRACK_BITS: u32 = 20;
+const TRACK_SLOTS: usize = 1 << TRACK_BITS;
+/// An address slot that used to hold an allocation which has been freed since.
+const FREED: usize = 1;
+
+/// The allocations alive right now that were made while [`TRACK`] was set: an open addressing
+/// hash table from address to size, so that their memory can be searched for values. It can't
+/// allocate, being part of the allocator.
+static TRACKED: Tracked = Tracked {
+    addrs: [const { AtomicUsize::new(0) }; TRACK_SLOTS],
+    sizes: [const { AtomicUsize::new(0) }; TRACK_SLOTS],
+};
+
+struct Tracked {
+    /// 0: never used, [`FREED`], or the address of a live allocation.
+    addrs: [AtomicUsize; TRACK_SLOTS],
+    sizes: [AtomicUsize; TRACK_SLOTS],
+}
+
+impl Tracked {
+    fn slots(addr: usize) -> impl Iterator<Item = usize> {
+        let first = (addr as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> (64 - TRACK_BITS);
+        (0..TRACK_SLOTS).map(move |i| (first as usize + i) % TRACK_SLOTS)
+    }
+
+    fn insert(&self, addr: usize, size: usize) {
+        for slot in Self::slots(addr) {
+            let cur = self.addrs[slot].load(Ordering::Relaxed);
+            if (cur == 0 || cur == FREED)
+                && self.addrs[slot]
+                    .compare_exchange(cur, addr, Ordering::Relaxed, Ordering::Relaxed)
+                    .is_ok()
+            {
+                self.sizes[slot].store(size, Ordering::Relaxed);
+                return;
+            }
+        }
+        TRACK_OVERFLOW.store(true, Ordering::Relaxed);
+    }
+
+    fn remove(&self, addr: usize) {
+        for slot in Self::slots(addr) {
+            match self.addrs[slot].load(Ordering::Relaxed) {
+                0 => return,
+                cur if cur == addr => {
+                    self.addrs[slot].store(FREED, Ordering::Relaxed);
+                    return;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn clear(&self) {
+        for slot in &self.addrs {
+            slot.store(0, Ordering::Relaxed);
+        }
+    }
+
+    /// Address and size of every live tracked allocation.
+    fn live(&self) -> impl Iterator<Item = (usize, usize)> + '_ {
+        self.addrs
+            .iter()
+            .zip(&self.sizes)
+            .map(|(a, s)| (a.load(Ordering::Relaxed), s.load(Ordering::Relaxed)))
+            .filter(|(a, _)| *a != 0 && *a != FREED)
+    }
+}
+
 impl Counting {
-    fn born(ptr: *mut u8) {
+    fn born(ptr: *mut u8, size: usize) {
         LIVE.fetch_add(1, Ordering::Relaxed);
-        if RECORD.load(Ordering::Relaxed) && !ptr.is_null() {
+        if ptr.is_null() {
+            return;
+        }
+        if RECORD.load(Ordering::Relaxed) {
             Self::replace(0, ptr as usize);
         }
+        if TRACK.load(Ordering::Relaxed) {
+            TRACKED.insert(ptr as usize, size);
+        }
+    }
+
+    /// Track every allocation made from now on, until [`Counting::values_in_live_memory`].
+    fn start_tracking() {
+        TRACKED.clear();
+        TRACK_OVERFLOW.store(false, Ordering::Relaxed);
+        TRACKING.store(true, Ordering::Relaxed);
+        TRACK.store(true, Ordering::Relaxed);
+    }
+
+    /// Searches the memory of every tracked allocation that is still alive for the values
+    /// `Val::new(first)` ..= `Val::new(last)`, and returns how many different ones are there.
+    /// Ends the tracking. `None` if the table overflowed.
+    ///
+    /// This finds a value wherever a subject keeps it: in a `Box`, inside an `Arc` or a list
+    /// node, or copied into a buffer. Freed memory is wiped while tracking, so a value can only
+    /// be found in memory the subject still holds.
+    ///
+    /// SAFETY: nothing else may free or resize tracked allocations while this runs.
+    unsafe fn values_in_live_memory(first: u64, last: u64) -> Option<u64> {
+        TRACK.store(false, Ordering::Relaxed);
+        let mut seen = vec![false; (last - first + 1) as usize];
+        const VAL: usize = std::mem::size_of::<Val>();
+        for (addr, size) in TRACKED.live() {
+            // a `Val` is aligned to 8 bytes wherever it is
+            let mut at = addr.next_multiple_of(8);
+            while at + VAL <= addr + size {
+                // SAFETY: inside a live allocation. Unaligned and volatile because this is
+                // somebody else's memory, read behind their back.
+                let Val(w) = unsafe { std::ptr::read_volatile(at as *const Val) };
+                if (first..=last).contains(&w[0]) && Val::new(w[0]) == Val(w) {
+                    seen[(w[0] - first) as usize] = true;
+                }
+                at += 8;
+            }
+        }
+        TRACKING.store(false, Ordering::Relaxed);
+        let found = seen.iter().filter(|s| **s).count() as u64;
+        (!TRACK_OVERFLOW.load(Ordering::Relaxed)).then_some(found)
     }
 
     /// Puts `new` into the first slot holding `old`.
@@ -75,7 +196,7 @@ impl Counting {
 unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         let ptr = unsafe { System.alloc(layout) };
-        Self::born(ptr);
+        Self::born(ptr, layout.size());
         ptr
     }
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
@@ -83,18 +204,39 @@ unsafe impl GlobalAlloc for Counting {
         if WATCHING.load(Ordering::Relaxed) {
             Self::replace(ptr as usize, 0);
         }
+        if TRACKING.load(Ordering::Relaxed) {
+            TRACKED.remove(ptr as usize);
+        }
+        // Always, not only while tracking: a value left in freed memory would be found again
+        // once that memory is part of a tracked allocation that does not overwrite it.
+        unsafe { std::ptr::write_bytes(ptr, 0, layout.size()) };
         unsafe { System.dealloc(ptr, layout) }
     }
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
         let ptr = unsafe { System.alloc_zeroed(layout) };
-        Self::born(ptr);
+        Self::born(ptr, layout.size());
         ptr
     }
+    /// Always moves, so that the old block goes through the same wipe as a freed one.
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        let new = unsafe { System.realloc(ptr, layout, new_size) };
-        if WATCHING.load(Ordering::Relaxed) && !new.is_null() && new != ptr {
+        // SAFETY: the caller guarantees `new_size` is valid for this alignment.
+        let new_layout = unsafe { Layout::from_size_align_unchecked(new_size, layout.align()) };
+        let new = unsafe { System.alloc(new_layout) };
+        if new.is_null() {
+            return new;
+        }
+        unsafe { std::ptr::copy_nonoverlapping(ptr, new, layout.size().min(new_size)) };
+        if WATCHING.load(Ordering::Relaxed) {
             Self::replace(ptr as usize, new as usize);
         }
+        if TRACKING.load(Ordering::Relaxed) {
+            TRACKED.remove(ptr as usize);
+            if TRACK.load(Ordering::Relaxed) {
+                TRACKED.insert(new as usize, new_size);
+            }
+        }
+        unsafe { std::ptr::write_bytes(ptr, 0, layout.size()) };
+        unsafe { System.dealloc(ptr, layout) };
         new
     }
 }
@@ -113,7 +255,14 @@ struct Left {
     read_value: u64,
     /// `retained` again, after everything has been idle for [`REST`].
     retained_later: u64,
+    /// Old values (every value ever published but the current one) that are still somewhere
+    /// in memory the subject holds. `None` if they could not be counted.
+    values: Option<u64>,
 }
+
+/// The values the probe publishes are `Val::new(PROBE_BASE + n)`: unlikely to be in memory
+/// by accident.
+const PROBE_BASE: u64 = 0x5eed_0000_0000_0000;
 
 /// How long everything stays idle before the allocations are counted a second time.
 const REST: Duration = Duration::from_millis(200);
@@ -208,14 +357,16 @@ impl Idle {
 /// reader then does nothing but keep its handle; without, it drops the handle and its thread
 /// ends. The writer then publishes [`IDLE_WRITES`] more values.
 fn left_after_writes<S: Subject>(stays: bool) -> Left {
-    let (mut w, mut rs) = S::new(Val::new(0), 1);
+    let val = |n: u64| Val::new(PROBE_BASE + n);
+    Counting::start_tracking();
+    let (mut w, mut rs) = S::new(val(0), 1);
     let mut r = rs.pop().expect("one reader");
     drop(rs);
     // whatever the first write sets up is not part of the value
-    S::write(&mut w, Val::new(1));
+    S::write(&mut w, val(1));
     // the value the reader is going to read: watch what is allocated to publish it
     Counting::start_recording();
-    S::write(&mut w, Val::new(2));
+    S::write(&mut w, val(2));
     Counting::stop_recording();
 
     let (has_read, wait_read) = mpsc::channel();
@@ -239,10 +390,14 @@ fn left_after_writes<S: Subject>(stays: bool) -> Left {
 
     let before = LIVE.load(Ordering::Relaxed);
     for i in 1..=IDLE_WRITES {
-        S::write(&mut w, Val::new(2 + i));
+        S::write(&mut w, val(2 + i));
     }
     let after = LIVE.load(Ordering::Relaxed);
     let read_value = Counting::watched_alive();
+    // Every value but the current one, which is the last. SAFETY: the reader is parked or
+    // gone, and this thread is the writer.
+    let values =
+        unsafe { Counting::values_in_live_memory(PROBE_BASE, PROBE_BASE + 1 + IDLE_WRITES) };
     // the writer has stopped: does anything free what it left behind?
     std::thread::sleep(REST);
     let later = LIVE.load(Ordering::Relaxed);
@@ -255,6 +410,7 @@ fn left_after_writes<S: Subject>(stays: bool) -> Left {
         retained: (after - before).max(0) as u64,
         read_value,
         retained_later: (later - before).max(0) as u64,
+        values,
     }
 }
 
@@ -390,17 +546,20 @@ fn markdown(dir: &Path) -> bool {
         println!("### Idle readers and idle writers\n");
         println!(
             "The writer publishes a value, one reader reads it and then does nothing, and the \
-             writer publishes {IDLE_WRITES} more. \"Left\" counts the allocations made by those \
-             writes that are still alive, \"read value\" whether the allocations of the value \
-             the reader read are. The \"no reader\" columns repeat this with the reader gone \
-             before the writes, and once more after {} ms of nothing happening: what is left \
-             there is left by the subject itself, because it frees in batches.\n",
+             writer publishes {IDLE_WRITES} more. \"Allocations\" counts the allocations made \
+             by those writes that are still alive, \"values\" the old values that are still \
+             somewhere in memory the subject holds, \"read value\" whether the allocations of \
+             the value the reader read are still alive. The \"no reader\" columns repeat this \
+             with the reader gone before the writes, and the allocations once more after {} ms \
+             of nothing happening: what is left there is left by the subject itself, because \
+             it frees in batches.\n",
             REST.as_millis()
         );
         println!(
-            "| Subject | Left | Read value | Left, no reader | Later | Idle reader keeps | Reclaims |"
+            "| Subject | Allocations | Values | Read value | Allocations, no reader | Values, no reader | Later | Idle reader keeps | Reclaims |"
         );
-        println!("|---|---:|---:|---:|---:|---|---|");
+        println!("|---|---:|---:|---:|---:|---:|---:|---|---|");
+        let count = |v: Option<u64>| v.map_or("?".to_string(), |v| v.to_string());
         for (s, i) in rcu_bench::subjects().iter().zip(idle_all()) {
             let keeps = match i.keeps() {
                 Keeps::Nothing => "nothing",
@@ -414,11 +573,13 @@ fn markdown(dir: &Path) -> bool {
                 Reclaim::Never => "not in this test",
             };
             println!(
-                "| `{}` | {} | {} | {} | {} | {keeps} | {reclaim} |",
+                "| `{}` | {} | {} | {} | {} | {} | {} | {keeps} | {reclaim} |",
                 s.name,
                 i.idle.retained,
+                count(i.idle.values),
                 i.idle.read_value,
                 i.alone.retained,
+                count(i.alone.values),
                 i.alone.retained_later
             );
         }
@@ -461,6 +622,8 @@ fn json(dir: &Path) -> bool {
                     "read_value_alone": idle.alone.read_value,
                     "keeps": idle.keeps().id(),
                     "blocks": idle.keeps() == Keeps::Everything,
+                    "values": idle.idle.values,
+                    "values_at_rest": idle.alone.values,
                     "left_at_rest": idle.alone.retained,
                     "left_at_rest_later": idle.alone.retained_later,
                     "rest_ms": REST.as_millis() as u64,

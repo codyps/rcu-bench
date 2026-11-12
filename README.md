@@ -123,7 +123,10 @@ Not included:
   the writer publishes 100,000 more. It then counts the allocations made by
   those writes that are still alive, and looks at whether the allocations of
   the value the reader read are (both again with the reader gone before the
-  writes, as a control). On the results page ◆ marks subjects where the idle
+  writes, as a control). Next to the allocations it counts the old values
+  themselves, by searching the memory of every live allocation for them
+  (freed memory is wiped): a subject may need several allocations to keep
+  one value, or none for a value stored in place. On the results page ◆ marks subjects where the idle
   reader keeps every value since its read alive (`local-rcu-cached`,
   `read-copy-update`), and ◇ those where it keeps only the value it read
   (`arc-swap-cache`, `hazarc-cache`, `arcshift`). The markdown report lists

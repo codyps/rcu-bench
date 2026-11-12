@@ -258,7 +258,9 @@ ul.caveats li { margin-bottom: 4px; }
       <li>The range drawn around each dot on the log scale is criterion's 95% confidence interval for the median.</li>
       <li><span class="hold">◆</span> and <span class="hold">◇</span> mark subjects whose readers keep old values alive while idle.
         It is measured, not declared: the writer publishes a value, one reader reads it and then does nothing, and the writer
-        publishes 100,000 more. <span class="hold">◆</span>: most of those are still allocated afterwards, and would not be had the
+        publishes 100,000 more. Two things are counted afterwards: the allocations made by those writes that are still alive, and
+        the old values that can still be found in memory the subject holds (freed memory is wiped). The marks go by the
+        allocations; a subject may need more than one per value it keeps, so the two counts differ. <span class="hold">◆</span>: most of those are still allocated afterwards, and would not be had the
         reader gone away first. <span class="hold">◇</span>: only the value the reader read is still allocated, typically because
         the reader holds an <code>Arc</code> of it. <code>local-rcu-cached</code> is ◆ by design (call <code>release()</code>
         before going idle); plain <code>local-rcu</code> keeps nothing.</li>
@@ -356,14 +358,27 @@ function holds(s) {
   return k in HOLD ? k : null;
 }
 const holdAria = (s) => ({ all: ", an idle reader keeps every value since its last read alive", one: ", an idle reader keeps the value it last read alive" }[holds(s)] || "");
+/* "12 old values in 36 allocations", or just the allocations for results without a value count */
+function leftText(values, allocs) {
+  const a = `${fmtCount(allocs)} allocation${allocs === 1 ? "" : "s"}`;
+  return values == null ? a : `${fmtCount(values)} old value${values === 1 ? "" : "s"} in ${a}`;
+}
 function idleText(s) {
   const i = s.idle;
   if (!i) return null;
-  const left = `${fmtCount(i.retained)} allocations left after ${fmtCount(i.writes)} writes`;
+  const left = `${leftText(i.values, i.retained)} left after ${fmtCount(i.writes)} writes`;
   if (holds(s) === "all") return `keeps every value since its last read: ${left}`;
   if (holds(s) === "one") return `keeps the value it last read, nothing newer (${left})`;
   if (i.retained_alone >= i.writes / 2) return "no effect; old values are not freed in this test even without a reader";
   return `keeps nothing (${left})`;
+}
+function holdKey(host, subjects) {
+  for (const k in HOLD) {
+    if (subjects.some((s) => holds(s) === k)) host.append(" ", el("span", { class: "hold" }, HOLD[k]), " " + HOLD_KEY[k]);
+  }
+  for (const k in BATCH) {
+    if (subjects.some((s) => batches(s) === k)) host.append(" ", el("span", { class: "batch" }, BATCH[k]), " " + BATCH_KEY[k]);
+  }
 }
 /* marks for subjects that free old values in batches: some are left when the writer stops */
 const BATCH = { batched: "≡", background: "↻" };
@@ -380,9 +395,9 @@ const batchAria = (s) => ({ batched: ", frees old values in batches on later wri
 function restText(s) {
   const i = s.idle;
   if (!i || i.left_at_rest == null) return null;
-  const left = `${fmtCount(i.left_at_rest)} allocations left after ${fmtCount(i.writes)} writes and no reader`;
+  const left = `${leftText(i.values_at_rest, i.left_at_rest)} left after ${fmtCount(i.writes)} writes and no reader`;
   if (i.reclaim === "batched") return `old values wait for a later write: ${left}`;
-  if (i.reclaim === "background") return `${left}, ${fmtCount(i.left_at_rest_later)} after ${i.rest_ms} ms: freed in the background`;
+  if (i.reclaim === "background") return `${left}, ${fmtCount(i.left_at_rest_later)} allocations after ${i.rest_ms} ms: freed in the background`;
   if (i.reclaim === "never") return `old values are not freed in this test (${left})`;
   return `nothing waits (${left})`;
 }
@@ -395,14 +410,6 @@ function marks(s, make) {
 }
 const svgMark = (cls, glyph) => svg("tspan", { class: cls, dx: 5 }, glyph);
 const htmlMark = (cls, glyph) => el("span", { class: cls }, glyph);
-function holdKey(host, subjects) {
-  for (const k in HOLD) {
-    if (subjects.some((s) => holds(s) === k)) host.append(" ", el("span", { class: "hold" }, HOLD[k]), " " + HOLD_KEY[k]);
-  }
-  for (const k in BATCH) {
-    if (subjects.some((s) => batches(s) === k)) host.append(" ", el("span", { class: "batch" }, BATCH[k]), " " + BATCH_KEY[k]);
-  }
-}
 const readersLabel = (r) => (r === 0 ? "no readers" : r === 1 ? "1 reader" : `${r} readers`);
 
 /* ---------- data access ---------- */
@@ -811,10 +818,14 @@ function renderTable() {
   };
   mk("Subject", "name");
   for (const r of cs) mk(readersLabel(r), r);
-  /* columns that count allocations instead of timing something */
+  /* columns that count what is left in memory instead of timing something */
+  const idleTip = (s) => `Idle reader ${idleText(s)}.`, restTip = (s) => `Idle writer: ${restText(s)}.`;
+  const holdAll = (s) => (holds(s) === "all" ? "hold" : null), batch = (s) => (batches(s) ? "batch" : null);
   const extra = [
-    { id: "idle", label: "Left by an idle reader", val: (s) => s.idle && s.idle.retained, text: (s) => `Idle reader ${idleText(s)}.`, mark: (s) => (holds(s) === "all" ? "hold" : null) },
-    { id: "rest", label: "Left when writes stop", val: (s) => s.idle && s.idle.left_at_rest, text: (s) => `Idle writer: ${restText(s)}.`, mark: (s) => (batches(s) ? "batch" : null) },
+    { id: "idle-values", label: "Old values held with an idle reader", val: (s) => s.idle && s.idle.values, text: idleTip, mark: holdAll },
+    { id: "idle", label: "Allocations left with an idle reader", val: (s) => s.idle && s.idle.retained, text: idleTip, mark: holdAll },
+    { id: "rest-values", label: "Old values held when writes stop", val: (s) => s.idle && s.idle.values_at_rest, text: restTip, mark: batch },
+    { id: "rest", label: "Allocations left when writes stop", val: (s) => s.idle && s.idle.left_at_rest, text: restTip, mark: batch },
   ].filter((c) => run().subjects.some((s) => c.val(s) != null));
   for (const c of extra) mk(c.label, c.id);
   thead.append(tr);
@@ -869,8 +880,7 @@ function renderTable() {
   desc.textContent = "Median time per operation. Click a column to sort by it, click a row to pin it in the charts.";
   if (extra.length) {
     const w = run().subjects.find((s) => s.idle).idle.writes;
-    const what = extra.map((c) => (c.id === "idle" ? "past a reader that read once and then went idle" : "with no reader at all")).join(", and ");
-    desc.append(` The last ${extra.length > 1 ? `${extra.length} columns are` : "column is"} not a time: ${extra.length > 1 ? "they count" : "it counts"} the allocations still alive after ${fmtCount(w)} writes ${what}.`);
+    desc.append(` The last ${extra.length} columns are not times. They show what is still in memory after ${fmtCount(w)} writes, with a reader that read once and then went idle, and with no reader at all: the old values the subject still holds, and the allocations made by those writes that are still alive. One held value can take several allocations, and a value stored in place takes none.`);
     holdKey(desc, subjects);
   }
 }

@@ -82,7 +82,7 @@ and whatever the crate does about the old one.
 | `rcu_cell` | `rcu_cell` | `RcuCell::read`, `write` |
 | `basedrop` | `basedrop` | `SharedCell::get`, `set`; the writer runs the `Collector` after every write |
 | `concread-cowcell` | `concread` | `CowCell::read`, write transaction + `commit` |
-| `seqlock` | `seqlock` | `read` (copies the value out), `lock_write` |
+| `seqlock` | `seqlock` | `read` (copies the value out), `lock_write`. `Copy` values only, marked "Copy" on the results page |
 | `keepcalm-rcu` | `keepcalm` | `SharedMut::new_rcu`, `read`, `set` |
 | `crossbeam-epoch` | `crossbeam-epoch` | `Atomic<T>` in the global collector; `pin` per read, `defer_destroy` per write |
 | `seize` | `seize` | `AtomicPtr` + a `Collector`; `enter` + `protect` per read, `retire` per write |
@@ -165,4 +165,5 @@ on pushes to `main`, on a schedule and by hand, never for pull requests.
 1. Add the crate to `Cargo.toml` and a module in `src/subjects/` implementing
    `Subject` (name, kind, a one-line description, and the three operations).
 2. List it in `for_each_subject!` in `src/lib.rs`.
+   Set `COPY_ONLY` if the crate can only hold `Copy` values.
 3. `cargo test --release` checks it sequentially and concurrently.

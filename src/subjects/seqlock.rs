@@ -10,6 +10,7 @@ impl Subject for SeqLock {
     const NAME: &'static str = "seqlock";
     const KIND: Kind = Kind::Reference;
     const DESC: &'static str = "SeqLock::read copies the value out; lock_write. Copy values only.";
+    const COPY_ONLY: bool = true;
     type Writer = Arc<Cell>;
     type Reader = Arc<Cell>;
 

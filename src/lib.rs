@@ -57,6 +57,7 @@ pub struct SubjectInfo {
     pub name: &'static str,
     pub kind: Kind,
     pub desc: &'static str,
+    pub copy_only: bool,
 }
 
 /// One crate (or one way of using a crate), reduced to read and write.
@@ -67,6 +68,11 @@ pub trait Subject: 'static {
     const KIND: Kind;
     /// How the crate is used here, in a sentence.
     const DESC: &'static str;
+
+    /// Whether the crate only stores `Copy` values, handing readers a copy instead of a
+    /// reference. Such a cell has no old values to keep alive or to free, which is much of why
+    /// it is fast, and cannot hold anything that owns memory.
+    const COPY_ONLY: bool = false;
 
     /// How many readers the subject supports.
     const MAX_READERS: usize = usize::MAX;
@@ -95,6 +101,7 @@ pub fn subjects() -> Vec<SubjectInfo> {
                 name: <$t as Subject>::NAME,
                 kind: <$t as Subject>::KIND,
                 desc: <$t as Subject>::DESC,
+                copy_only: <$t as Subject>::COPY_ONLY,
             });
         };
     }

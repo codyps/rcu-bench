@@ -665,6 +665,7 @@ fn json(dir: &Path) -> bool {
                 "name": s.name,
                 "kind": s.kind.id(),
                 "desc": s.desc,
+                "copy_only": s.copy_only,
                 "idle": {
                     "writes": IDLE_WRITES,
                     "retained": idle.idle.retained,

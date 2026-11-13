@@ -100,7 +100,9 @@ button:focus-visible, [tabindex]:focus-visible, th button:focus-visible { outlin
 #chart .name.self { font-weight: 700; }
 #chart .hold, .hold { fill: var(--hold); color: var(--hold); font-weight: 400; }
 #chart .batch, #scaling .batch, .batch { fill: var(--ink-2); color: var(--ink-2); font-weight: 400; }
-td span.hold, td span.batch { margin-left: 0.4em; }
+#chart .copy, #scaling .copy, .copy { fill: var(--ink-2); color: var(--ink-2); font-weight: 400; font-size: 10.5px; letter-spacing: 0.02em; }
+span.copy { border: 1px solid var(--border); border-radius: 4px; padding: 0 4px; white-space: nowrap; }
+td span.hold, td span.batch, td span.copy { margin-left: 0.4em; }
 #chart .val { fill: var(--ink); font-variant-numeric: tabular-nums; }
 #chart .ratio { fill: var(--muted); font-size: 11.5px; font-variant-numeric: tabular-nums; }
 #chart .row { cursor: pointer; outline: none; }
@@ -271,6 +273,9 @@ ul.caveats li { margin-bottom: 4px; }
         200 ms later; a subject whose leftovers are gone by then would be marked <span class="batch">↻</span> instead, for a
         background task doing the freeing. No subject here has one. <code>basedrop</code>'s collector could run on another
         thread, but this benchmark runs it in the writer after every write.</li>
+      <li><span class="copy">Copy</span> marks subjects that can only hold <code>Copy</code> values (plain data with no pointers,
+        nothing that owns memory). A read copies the whole value out instead of borrowing it. That is fast for the four
+        <code>u64</code>s used here, costs more the larger the value, and rules out a <code>Vec</code>, a <code>String</code> or a map.</li>
       <li><code>baseline-leak</code> never frees anything. It is the floor, not a contender.</li>
     </ul>
   </div>
@@ -380,6 +385,7 @@ function holdKey(host, subjects) {
   for (const k in BATCH) {
     if (subjects.some((s) => batches(s) === k)) host.append(" ", el("span", { class: "batch" }, BATCH[k]), " " + BATCH_KEY[k]);
   }
+  if (subjects.some(copies)) host.append(" ", el("span", { class: "copy" }, COPY), " " + COPY_KEY);
 }
 /* marks for subjects that free old values in batches: some are left when the writer stops */
 const BATCH = { batched: "≡", background: "↻" };
@@ -402,11 +408,16 @@ function restText(s) {
   if (i.reclaim === "never") return `old values are not freed in this test (${left})`;
   return `nothing waits (${left})`;
 }
+/* marks a subject that only stores `Copy` values and hands out copies */
+const COPY = "Copy";
+const COPY_KEY = "Only holds Copy values: a read copies the value out instead of borrowing it, so there are no old values to keep or free.";
+const copies = (s) => !!s.copy_only;
 /* the marks of one subject, as elements made by `make(class, glyph)` */
 function marks(s, make) {
   const out = [];
   if (holds(s)) out.push(make("hold", HOLD[holds(s)]));
   if (batches(s)) out.push(make("batch", BATCH[batches(s)]));
+  if (copies(s)) out.push(make("copy", COPY));
   return out;
 }
 const svgMark = (cls, glyph) => svg("tspan", { class: cls, dx: 5 }, glyph);
@@ -577,7 +588,7 @@ function renderChart() {
       class: "row" + (s.name === state.pinned ? " pinned" : ""),
       tabindex: 0, role: "listitem",
       "aria-label": `${s.name}: ${fmt(r.median)}` + (ratio && s.name !== SELF ? `, ${fmtRatio(ratio)} local-rcu` : "")
-        + holdAria(s) + batchAria(s),
+        + holdAria(s) + batchAria(s) + (copies(s) ? ", only holds Copy values" : ""),
     });
     row.append(svg("rect", { class: "bg", x: 0, y: y + 1, width: W, height: rowH - 2, rx: 5 }));
     const name = svg("text", { class: "name" + (isOurs(s.name) ? " self" : ""), x: labelW, y: cy + 4, "text-anchor": "end" }, s.name);
@@ -775,6 +786,7 @@ function showRowTip(s, ratio, ev, anchor) {
   add("95% CI", `${fmt(r.lo)} – ${fmt(r.hi)}`);
   if (ratio && s.name !== SELF) add("vs local-rcu", ratio >= 1 ? `${fmtRatio(ratio)} slower` : `${fmtRatio(1 / ratio)} faster`);
   add("Kind", kindLabel(s.kind));
+  if (copies(s)) add("Values", "Copy types only; a read copies the value out");
   if (idleText(s)) add("Idle reader", idleText(s));
   if (restText(s)) add("Idle writer", restText(s));
   tip.append(dl, el("p", { class: "t-desc" }, s.desc));

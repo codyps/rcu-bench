@@ -404,8 +404,8 @@ checksum = "65cd87c9a6d60536580b316ad985726104730a5151c99845f2490428ef91240a"
 
 [[package]]
 name = "local-rcu"
-version = "1.1.0"
-source = "git+https://github.com/codyps/local-rcu#451f96d89db29b2eba69c39befa46000e5df389b"
+version = "1.1.1"
+source = "git+https://github.com/codyps/local-rcu#29c538a9ca81080a61a590a8e93a03789221e09e"
 dependencies = [
  "loom 0.7.3",
  "slab",
@@ -704,12 +704,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
 
 [[package]]
-name = "saa"
-version = "5.6.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4e80a530676d97ef2167d7fb184a860166cd265bf98be494064828d7aaa43446"
-
-[[package]]
 name = "same-file"
 version = "1.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -732,12 +726,9 @@ checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 
 [[package]]
 name = "sdd"
-version = "4.8.11"
+version = "4.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a31877eee03686b905845993b5d9809a220c9dd5a10e9d6021d7ca67384c9070"
-dependencies = [
- "saa",
-]
+checksum = "2c245d45885f6ed069d264a9c8b9f3e8f5a293b96fe7ea03f5c5e56ee9c2866e"
 
 [[package]]
 name = "seize"

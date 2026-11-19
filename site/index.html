@@ -712,7 +712,7 @@ function renderChart() {
   const notes = [];
   if (selfVal != null && selfShown) notes.push("The vertical line marks local-rcu.");
   if (missing.length) notes.push(`Not measured here: ${missing.join(", ")}.`);
-  if (stuck.length) notes.push(`Stalled, so not measured: ${stuck.map((s) => { const v = stalledAt(s, state.readers); return `${s.name} (${v.done} ${g.op}s in ${v.secs} s)`; }).join(", ")}. Beside that many threads the ${g.op === "write" ? "writer" : "readers"} got next to nowhere.`);
+  if (stuck.length) notes.push(`Stalled, so not measured: ${stuck.map((s) => { const v = stalledAt(s, state.readers); return `${s.name} (${v.done} ${g.op}${v.done === 1 ? "" : "s"} in ${v.secs} s)`; }).join(", ")}. Beside that many threads the ${g.op === "write" ? "writer" : "readers"} got next to nowhere.`);
   const short = rows.filter((s) => result(s).writer_short);
   if (short.length) notes.push(`${SHORT} The writer did not reach ${fmtRate(g.write_hz)} writes per second: ${short.map((s) => `${s.name} (${fmtRate(result(s).write_hz)})`).join(", ")}.`);
   $("#chart-note").textContent = notes.join(" ");
@@ -961,7 +961,7 @@ function renderTable() {
     for (const r of cs) {
       const v = series(s)[r];
       const td = el("td", {}, v ? fmt(v.median) : stalledAt(s, r) ? "stalled" : "—");
-      if (stalledAt(s, r)) td.title = `Not measured: ${stalledAt(s, r).done} ${group().op}s in ${stalledAt(s, r).secs} s.`;
+      if (stalledAt(s, r)) td.title = `Not measured: ${stalledAt(s, r).done} ${group().op}${stalledAt(s, r).done === 1 ? "" : "s"} in ${stalledAt(s, r).secs} s.`;
       if (!v) td.classList.add("none");
       else if (v.write_hz != null) {
         td.title = `The writer made ${writesText(v)}.`;

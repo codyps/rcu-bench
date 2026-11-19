@@ -826,8 +826,11 @@ fn markdown(dir: &Path) -> bool {
             let stalled = stalled(dir, g.id, name);
             for (c, s) in &stalled {
                 stuck.push(format!(
-                    "`{name}` at R = {c} ({} {}s in {} s)",
-                    s.done, g.op, s.secs
+                    "`{name}` at R = {c} ({} {}{} in {} s)",
+                    s.done,
+                    g.op,
+                    if s.done == 1.0 { "" } else { "s" },
+                    s.secs
                 ));
             }
             for (c, e) in e.iter().filter(|(_, e)| e.writer_short()) {

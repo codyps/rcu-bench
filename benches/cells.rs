@@ -683,7 +683,9 @@ impl Histogram {
 
 /// Does `op` again and again for `time`, and times every single one. The clock is read once
 /// per operation: the end of one is the start of the next, so each time includes one reading
-/// of the clock. The first tenth of the time is a warm-up and is not counted.
+/// of the clock. The first tenth of the time is a warm-up: an operation that ends in it is not
+/// counted. One that ends after it is, however early it began, so that an operation which
+/// takes the whole time is still there as the slowest.
 fn time_each(time: Duration, mut op: impl FnMut()) -> Histogram {
     let mut h = Histogram::new();
     let mut last = Instant::now();
@@ -692,7 +694,7 @@ fn time_each(time: Duration, mut op: impl FnMut()) -> Histogram {
     loop {
         op();
         let now = Instant::now();
-        if last >= counted_from {
+        if now >= counted_from {
             h.record((now - last).as_nanos() as u64);
         }
         last = now;

@@ -657,6 +657,12 @@ fn fmt_rate(hz: f64) -> String {
     }
 }
 
+/// A table cell: the median, marked if the writer beside it fell short of its rate.
+fn fmt_cell(e: &Estimate) -> String {
+    let mark = if e.writer_short() { " †" } else { "" };
+    format!("{}{mark}", fmt_ns(e.median))
+}
+
 fn fmt_ns(ns: f64) -> String {
     if ns >= 1_000_000.0 {
         format!("{:.1} ms", ns / 1_000_000.0)
@@ -709,17 +715,14 @@ fn markdown(dir: &Path) -> bool {
         println!("|---|{}", "---:|".repeat(counts.len()));
         let mut short = Vec::new();
         for (name, e) in rows {
-            let mut cells: Vec<_> = counts
-                .iter()
-                .map(|c| e.get(c).map_or("—".into(), |e| fmt_ns(e.median)))
-                .collect();
-            for (cell, c) in cells.iter_mut().zip(&counts) {
-                if let Some(e) = e.get(c).filter(|e| e.writer_short()) {
-                    let hz = fmt_count(e.write_hz.unwrap_or(0.0));
-                    short.push(format!("`{name}` at R = {c} ({hz})"));
-                    cell.push_str(" †");
-                }
+            for (c, e) in e.iter().filter(|(_, e)| e.writer_short()) {
+                let hz = fmt_count(e.write_hz.unwrap_or(0.0));
+                short.push(format!("`{name}` at R = {c} ({hz})"));
             }
+            let cells: Vec<_> = counts
+                .iter()
+                .map(|c| e.get(c).map_or("—".into(), fmt_cell))
+                .collect();
             println!("| `{name}` | {} |", cells.join(" | "));
         }
         println!();

@@ -144,5 +144,6 @@ macro_rules! for_each_subject {
         $m!($crate::subjects::sdd::Sdd);
         $m!($crate::subjects::haphazard::Haphazard);
         $m!($crate::subjects::kovan::Kovan);
+        $m!($crate::subjects::kovan::KovanRaw);
     };
 }

@@ -499,6 +499,13 @@ const GROUPS: &[(&str, &str, &str, &str)] = &[
         "The writer, while R readers read as fast as they can.",
         "write",
     ),
+    (
+        "write-idle",
+        "Write beside idle readers",
+        "The writer, with R readers idle: each has read once, on a thread of its own \
+         that then sleeps, and keeps its handle.",
+        "write",
+    ),
 ];
 
 /// Median time per operation in nanoseconds, with its confidence interval.

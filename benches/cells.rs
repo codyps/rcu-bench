@@ -5,11 +5,16 @@
 //! - `read`:        R readers, no writer
 //! - `read-writer`: R readers, while a writer publishes as fast as it can
 //! - `write`:       the writer, while R readers read as fast as they can (R starts at 0)
+//! - `write-idle`:  the writer, while R readers do nothing: each has read once, on a thread
+//!   of its own that then sleeps, and keeps its handle
 //!
 //! Benchmark ids are `<group>/<subject>/<R>`.
 //!
 //! `RCU_BENCH_MAX_READERS` caps R. By default it is the number of CPUs (at most 8). The
 //! groups with a writer stop one short of the cap, so that the writer has a CPU of its own.
+//!
+//! Idle readers need no CPU, so `write-idle` has a cap of its own: `RCU_BENCH_MAX_IDLE`, 64
+//! by default.
 //!
 //! Read groups report the time per read as seen by one reader (averaged over the readers).
 //! The write group reports the time per write.
@@ -35,6 +40,15 @@ fn reader_counts(limit: usize) -> Vec<usize> {
         .into_iter()
         .filter(|&r| r <= limit)
         .collect()
+}
+
+/// The numbers of idle readers to measure.
+fn idle_counts() -> Vec<usize> {
+    let max = match std::env::var("RCU_BENCH_MAX_IDLE") {
+        Ok(v) => v.parse().expect("RCU_BENCH_MAX_IDLE must be a number"),
+        Err(_) => 64,
+    };
+    [1, 4, 16, 64].into_iter().filter(|&r| r <= max).collect()
 }
 
 /// `readers` threads each do `iters` reads. Returns the mean time one reader took.
@@ -120,6 +134,45 @@ fn run_write<S: Subject>(iters: u64, readers: usize) -> Duration {
     elapsed
 }
 
+/// The writer does `iters` writes while `idle` readers do nothing. Each of them has read once,
+/// on a thread of its own, and that thread then sleeps without giving up its handle (or
+/// whatever the subject keeps per thread). Returns the time the writes took.
+fn run_write_idle<S: Subject>(iters: u64, idle: usize) -> Duration {
+    let (mut w, rs) = S::new(Val::new(0), idle);
+    let have_read = Arc::new(Barrier::new(idle + 1));
+    let stop = Arc::new(AtomicBool::new(false));
+
+    let reader_threads: Vec<_> = rs
+        .into_iter()
+        .map(|mut r| {
+            let have_read = have_read.clone();
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                black_box(S::read(&mut r));
+                have_read.wait();
+                while !stop.load(Ordering::Acquire) {
+                    std::thread::park();
+                }
+                drop(r);
+            })
+        })
+        .collect();
+
+    have_read.wait();
+    let t = Instant::now();
+    for i in 0..iters {
+        S::write(&mut w, Val::new(i));
+    }
+    let elapsed = t.elapsed();
+
+    stop.store(true, Ordering::Release);
+    for t in reader_threads {
+        t.thread().unpark();
+        t.join().unwrap();
+    }
+    elapsed
+}
+
 fn read_one<S: Subject>(g: &mut BenchmarkGroup<'_, WallTime>, counts: &[usize], with_writer: bool) {
     for &readers in counts {
         if readers > S::MAX_READERS {
@@ -131,13 +184,17 @@ fn read_one<S: Subject>(g: &mut BenchmarkGroup<'_, WallTime>, counts: &[usize], 
     }
 }
 
-fn write_one<S: Subject>(g: &mut BenchmarkGroup<'_, WallTime>, counts: &[usize]) {
+fn write_one<S: Subject>(g: &mut BenchmarkGroup<'_, WallTime>, counts: &[usize], idle: bool) {
     for &readers in counts {
         if readers > S::MAX_READERS {
             continue;
         }
         g.bench_function(BenchmarkId::new(S::NAME, readers), |b| {
-            b.iter_custom(|iters| run_write::<S>(iters, readers))
+            if idle {
+                b.iter_custom(|iters| run_write_idle::<S>(iters, readers))
+            } else {
+                b.iter_custom(|iters| run_write::<S>(iters, readers))
+            }
         });
     }
 }
@@ -153,11 +210,11 @@ fn read_group(c: &mut Criterion, name: &str, counts: &[usize], with_writer: bool
     g.finish();
 }
 
-fn write_group(c: &mut Criterion, name: &str, counts: &[usize]) {
+fn write_group(c: &mut Criterion, name: &str, counts: &[usize], idle: bool) {
     let mut g = c.benchmark_group(name);
     macro_rules! one {
         ($t:ty) => {
-            write_one::<$t>(&mut g, counts);
+            write_one::<$t>(&mut g, counts, idle);
         };
     }
     for_each_subject!(one);
@@ -173,7 +230,8 @@ fn benches(c: &mut Criterion) {
 
     read_group(c, "read", &alone, false);
     read_group(c, "read-writer", &beside_writer, true);
-    write_group(c, "write", &for_write);
+    write_group(c, "write", &for_write, false);
+    write_group(c, "write-idle", &idle_counts(), true);
 }
 
 criterion_group! {

@@ -23,7 +23,8 @@ cargo run --release --bin report       # markdown tables from target/criterion
 ```
 
 `RCU_BENCH_MAX_READERS` caps the number of reader threads. By default it is
-the number of CPUs, at most 8.
+the number of CPUs, at most 8. `RCU_BENCH_MAX_IDLE` caps the number of idle
+readers in `write-idle`, 64 by default.
 
 To look at your own run in the results page:
 
@@ -46,9 +47,17 @@ up to the cap), so the results show how each subject scales:
 | `read` | R readers | time per read, as seen by one reader |
 | `read-writer` | R readers + a writer publishing as fast as it can | time per read, as seen by one reader |
 | `write` | the writer + R readers reading as fast as they can (R starts at 0) | time per write |
+| `write-idle` | the writer + R idle readers (R = 1, 4, 16, 64) | time per write |
 
 The groups with a writer stop one reader short of the cap, so the writer has a
 CPU of its own.
+
+An idle reader in `write-idle` has read once, on a thread of its own, and that
+thread then sleeps without giving up its handle. It uses no CPU, so R is not
+tied to the number of CPUs (`RCU_BENCH_MAX_IDLE` caps it, 64 by default). What
+this shows is how the cost of a write grows with the number of readers that
+merely exist: a writer that looks at every reader, or at every thread known to
+a collector, pays for each of them.
 
 A read includes getting access (guard, lock, `Arc` clone, ...), looking at the
 value, and releasing access again. A write includes allocating the new value
@@ -89,6 +98,7 @@ and whatever the crate does about the old one.
 | `sdd` | `sdd` | `AtomicOwned`; a `Guard` per read, a `Guard` and a `swap` per write (a thread only frees what it retired when it creates guards) |
 | `haphazard` | `haphazard` | `AtomicPtr`, one `HazardPointer` kept per reader; `retire` per write |
 | `kovan` | `kovan` | `Atom::load`, `store` |
+| `kovan-raw` | `kovan` | the lower level API, as in `kovan`'s own benchmarks: an `Atomic` of a node that embeds a `RetiredNode`; `pin` + `load` per read, `swap` + `retire` per write |
 
 Not included:
 

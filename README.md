@@ -229,7 +229,8 @@ runs with [`scripts/merge_results.py`](scripts/merge_results.py), and publishes
 
 Those runners have 4 CPUs and noisy neighbours, so the sweep is short (up to 4
 readers alone, 3 beside a writer, and 8 for the oversubscribed run) and the numbers are rougher than a run on a
-quiet machine.
+quiet machine. Each group runs as its own process, because `baseline-leak`
+never frees a value and one process for all groups runs out of memory there.
 
 To add a self-hosted machine, register a runner for this repository and set the
 repository variable `EXTRA_RUNNER` to its `runs-on` label (and optionally

@@ -78,8 +78,15 @@ jobs:
       - name: Check that every adapter behaves like a cell
         run: cargo test --release
 
+      # One process per group: baseline-leak never frees a value, and in one
+      # process for all groups it used up the runner's memory.
       - name: Run benchmarks
-        run: cargo bench --bench cells
+        run: |
+          groups=$(cargo bench --bench cells -- --list | sed -n 's|^\([a-z-]*\)/.*: benchmark$|\1|p' | uniq)
+          test -n "$groups"
+          for group in $groups; do
+            cargo bench --bench cells -- "^$group/"
+          done
 
       - name: Collect results
         env:

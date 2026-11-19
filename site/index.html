@@ -103,6 +103,8 @@ button:focus-visible, [tabindex]:focus-visible, th button:focus-visible { outlin
 #chart .copy, #scaling .copy, .copy { fill: var(--ink-2); color: var(--ink-2); font-weight: 400; font-size: 10.5px; letter-spacing: 0.02em; }
 span.copy { border: 1px solid var(--border); border-radius: 4px; padding: 0 4px; white-space: nowrap; }
 td span.hold, td span.batch, td span.copy { margin-left: 0.4em; }
+#chart .short, .short { fill: var(--ink-2); color: var(--ink-2); font-weight: 400; }
+td span.short { margin-left: 0.25em; }
 #chart .val { fill: var(--ink); font-variant-numeric: tabular-nums; }
 #chart .ratio { fill: var(--muted); font-size: 11.5px; font-variant-numeric: tabular-nums; }
 #chart .row { cursor: pointer; outline: none; }
@@ -257,8 +259,9 @@ ul.caveats li { margin-bottom: 4px; }
       <li>The writer in “Read beside a writer” publishes continuously, and the readers in “Write” read continuously.
         Both are far harsher than a typical read-mostly workload.</li>
       <li>In “Read beside a writer” a subject with cheap writes gets more of them, and its readers pay for each one, so its reads
-        can look slower than those of a subject with a slow writer. “Read beside a paced writer” gives every subject the same
-        50,000 writes per second (a writer too slow for that writes as fast as it can).</li>
+        can look slower than those of a subject with a slow writer. The operations named after a number of writes per second
+        hold the writer of every subject to that rate. Every read beside a writer shows the writes per second there really were;
+        <span class="short">†</span> marks a writer that was too slow for the rate, so its readers saw fewer writes than the others.</li>
       <li>The CI machines have 4 CPUs. Reads without a writer go up to 4 readers; with a writer the sweep stops at 3 so the writer has a CPU of its own.</li>
       <li>The range drawn around each dot on the log scale is criterion's 95% confidence interval for the median.</li>
       <li><span class="hold">◆</span> and <span class="hold">◇</span> mark subjects whose readers keep old values alive while idle.
@@ -356,6 +359,16 @@ function fmtTick(ns) {
 }
 const fmtRelTick = (v) => +v.toPrecision(3) + "×";
 const fmtCount = (n) => n.toLocaleString("en-US");
+/* writes per second, to three figures: the measured rates are not exact */
+function fmtRate(hz) {
+  if (hz >= 1e6) return +(hz / 1e6).toPrecision(3) + "M";
+  if (hz >= 1e3) return +(hz / 1e3).toPrecision(3) + "k";
+  return +hz.toPrecision(3) + "";
+}
+/* `write_hz` of a result is the writes per second the writer made while the readers were timed;
+   `writer_short` says that it was paced and stayed below its rate (the group's `write_hz`) */
+const SHORT = "†";
+const writesText = (r) => `${fmtRate(r.write_hz)} per second` + (r.writer_short ? `, short of ${fmtRate(group().write_hz)}` : "");
 /* `idle` is measured by the report tool: a reader reads once and then does nothing while the
    writer publishes `writes` values; `retained` allocations are still alive afterwards
    (`retained_alone` when the reader was gone before the writes). Older results lack it. */
@@ -591,11 +604,13 @@ function renderChart() {
       class: "row" + (s.name === state.pinned ? " pinned" : ""),
       tabindex: 0, role: "listitem",
       "aria-label": `${s.name}: ${fmt(r.median)}` + (ratio && s.name !== SELF ? `, ${fmtRatio(ratio)} local-rcu` : "")
-        + holdAria(s) + batchAria(s) + (copies(s) ? ", only holds Copy values" : ""),
+        + holdAria(s) + batchAria(s) + (copies(s) ? ", only holds Copy values" : "")
+        + (r.writer_short ? `, the writer only made ${writesText(r)}` : ""),
     });
     row.append(svg("rect", { class: "bg", x: 0, y: y + 1, width: W, height: rowH - 2, rx: 5 }));
     const name = svg("text", { class: "name" + (isOurs(s.name) ? " self" : ""), x: labelW, y: cy + 4, "text-anchor": "end" }, s.name);
     name.append(...marks(s, svgMark));
+    if (r.writer_short) name.append(svgMark("short", SHORT));
     row.append(name);
 
     if (state.scale === "log") {
@@ -633,6 +648,8 @@ function renderChart() {
   const notes = [];
   if (selfVal != null && selfShown) notes.push("The vertical line marks local-rcu.");
   if (missing.length) notes.push(`Not measured here: ${missing.join(", ")}.`);
+  const short = rows.filter((s) => result(s).writer_short);
+  if (short.length) notes.push(`${SHORT} The writer did not reach ${fmtRate(g.write_hz)} writes per second: ${short.map((s) => `${s.name} (${fmtRate(result(s).write_hz)})`).join(", ")}.`);
   $("#chart-note").textContent = notes.join(" ");
   holdKey($("#chart-note"), rows);
 }
@@ -787,6 +804,7 @@ function showRowTip(s, ratio, ev, anchor) {
   const dl = el("dl");
   const add = (k, v) => { dl.append(el("dt", {}, k), el("dd", {}, v)); };
   add("95% CI", `${fmt(r.lo)} – ${fmt(r.hi)}`);
+  if (r.write_hz != null) add("Writes", writesText(r));
   if (ratio && s.name !== SELF) add("vs local-rcu", ratio >= 1 ? `${fmtRatio(ratio)} slower` : `${fmtRatio(1 / ratio)} faster`);
   add("Kind", kindLabel(s.kind));
   if (copies(s)) add("Values", "Copy types only; a read copies the value out");
@@ -800,9 +818,10 @@ function showLineTip(l, r, ev) {
   const tip = tipHead(l.s, `${fmt(p.abs)} per ${g.op} with ${readersLabel(r)}`);
   const t = el("table"), tb = el("tbody");
   for (const q of l.pts) {
-    const tr = el("tr");
+    const tr = el("tr"), res = series(l.s)[q.r];
     if (q.r === r) tr.className = "cur";
     tr.append(el("td", {}, readersLabel(q.r)), el("td", {}, fmt(q.abs)), el("td", {}, q === base ? "" : fmtRatio(q.abs / base.abs)));
+    if (res && res.write_hz != null) tr.append(el("td", {}, `${fmtRate(res.write_hz)} writes/s` + (res.writer_short ? ` ${SHORT}` : "")));
     tb.append(tr);
   }
   t.append(tb);
@@ -877,6 +896,10 @@ function renderTable() {
       const v = series(s)[r];
       const td = el("td", {}, v ? fmt(v.median) : "—");
       if (!v) td.classList.add("none");
+      else if (v.write_hz != null) {
+        td.title = `The writer made ${writesText(v)}.`;
+        if (v.writer_short) td.append(htmlMark("short", SHORT));
+      }
       if (r === state.readers) td.classList.add("cur");
       row.append(td);
     }
@@ -894,6 +917,9 @@ function renderTable() {
   $("#table-title").textContent = `${group().title}: all reader counts`;
   const desc = $("#table-desc");
   desc.textContent = "Median time per operation. Click a column to sort by it, click a row to pin it in the charts.";
+  if (subjects.some((s) => Object.values(series(s)).some((v) => v.writer_short))) {
+    desc.append(` ${SHORT} The writer did not reach ${fmtRate(group().write_hz)} writes per second; hover for what it reached.`);
+  }
   if (extra.length) {
     const w = run().subjects.find((s) => s.idle).idle.writes;
     desc.append(` The last ${extra.length} columns are not times. They show what is still in memory after ${fmtCount(w)} writes, with a reader that read once and then went idle, and with no reader at all: the old values the subject still holds, and the allocations made by those writes that are still alive. One held value can take several allocations, and a value stored in place takes none.`);

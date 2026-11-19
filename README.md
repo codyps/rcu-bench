@@ -24,8 +24,9 @@ cargo run --release --bin report       # markdown tables from target/criterion
 
 `RCU_BENCH_MAX_READERS` caps the number of reader threads. By default it is
 the number of CPUs, at most 8. `RCU_BENCH_MAX_IDLE` caps the number of idle
-readers in `write-idle`, 64 by default. `RCU_BENCH_WRITE_HZ` sets the writes
-per second in `read-paced`, 50,000 by default.
+readers in `write-idle`, 64 by default. `RCU_BENCH_WRITE_HZ` and
+`RCU_BENCH_FAST_WRITE_HZ` set the writes per second in `read-paced` and
+`read-paced-fast`, 50,000 and 1,000,000 by default.
 
 To look at your own run in the results page:
 
@@ -48,6 +49,7 @@ up to the cap), so the results show how each subject scales:
 | `read` | R readers | time per read, as seen by one reader |
 | `read-writer` | R readers + a writer publishing as fast as it can | time per read, as seen by one reader |
 | `read-paced` | R readers + a writer publishing at a fixed rate | time per read, as seen by one reader |
+| `read-paced-fast` | the same at a higher rate | time per read, as seen by one reader |
 | `write` | the writer + R readers reading as fast as they can (R starts at 0) | time per write |
 | `write-idle` | the writer + R idle readers (R = 1, 4, 16, 64) | time per write |
 
@@ -57,12 +59,18 @@ CPU of its own.
 In `read-writer` the writers do not all do the same work: a subject with cheap
 writes gets more of them, and its readers pay for every one (a cache miss on
 the new value, at least). Its reads then look slower than those of a subject
-whose writer is slow. `read-paced` takes that out by giving every subject the
-same number of writes: `RCU_BENCH_WRITE_HZ` per second, 50,000 by default.
-The writer spins between writes instead of sleeping, so that it stays on its
-CPU and on time, and catches up without a pause after falling behind. A
-writer that cannot reach the rate at all writes as fast as it can and is named
-on stderr with the rate it did reach; its `read-paced` result is then for
+whose writer is slow. The paced groups take that out by giving every subject
+the same number of writes per second: 50,000 in `read-paced`, where most
+readers hardly notice the writer, and 1,000,000 in `read-paced-fast`, where
+they do but the slowest writers no longer keep up. The writer spins between
+writes instead of sleeping, so that it stays on its CPU and on time, and
+catches up without a pause after falling behind. A writer that cannot reach
+the rate at all writes as fast as it can.
+
+Every read group with a writer records the writes per second there really
+were (`writes.json`, next to criterion's results). The report and the results
+page show them, name the paced groups after the rate they ran at, and mark
+with † the results where the writer reached less than 90% of it: those are for
 fewer writes than the others had.
 
 An idle reader in `write-idle` has read once, on a thread of its own, and that

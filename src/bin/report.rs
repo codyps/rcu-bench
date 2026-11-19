@@ -484,51 +484,131 @@ fn idle_all() -> Vec<Idle> {
         .collect()
 }
 
-/// (id, title, what is running, what is reported)
-const GROUPS: &[(&str, &str, &str, &str)] = &[
-    ("read", "Read", "R readers at once, no writer.", "read"),
-    (
-        "read-writer",
-        "Read beside a writer",
-        "R readers, while a writer publishes as fast as it can.",
-        "read",
-    ),
-    (
-        "read-paced",
-        "Read beside a paced writer",
-        "R readers, while a writer publishes at a fixed rate, the same for every subject \
-         (50,000 writes per second unless RCU_BENCH_WRITE_HZ was set).",
-        "read",
-    ),
-    (
-        "write",
-        "Write",
-        "The writer, while R readers read as fast as they can.",
-        "write",
-    ),
-    (
-        "write-idle",
-        "Write beside idle readers",
-        "The writer, with R readers idle: each has read once, on a thread of its own \
-         that then sleeps, and keeps its handle.",
-        "write",
-    ),
+/// One benchmark group.
+struct Group {
+    id: &'static str,
+    title: &'static str,
+    /// What is running.
+    desc: &'static str,
+    /// What is timed: "read" or "write".
+    op: &'static str,
+    /// Whether the writer is held to a fixed rate. The title and description then name the
+    /// rate that was measured at, when the results have it.
+    paced: bool,
+}
+
+const GROUPS: &[Group] = &[
+    Group {
+        id: "read",
+        title: "Read",
+        desc: "R readers at once, no writer.",
+        op: "read",
+        paced: false,
+    },
+    Group {
+        id: "read-writer",
+        title: "Read beside a writer",
+        desc: "R readers, while a writer publishes as fast as it can.",
+        op: "read",
+        paced: false,
+    },
+    Group {
+        id: "read-paced",
+        title: "Read beside a paced writer",
+        desc: "R readers, while a writer publishes at a fixed rate, the same for every subject.",
+        op: "read",
+        paced: true,
+    },
+    Group {
+        id: "read-paced-fast",
+        title: "Read beside a fast paced writer",
+        desc: "R readers, while a writer publishes at a fixed, high rate, the same for every \
+               subject.",
+        op: "read",
+        paced: true,
+    },
+    Group {
+        id: "write",
+        title: "Write",
+        desc: "The writer, while R readers read as fast as they can.",
+        op: "write",
+        paced: false,
+    },
+    Group {
+        id: "write-idle",
+        title: "Write beside idle readers",
+        desc: "The writer, with R readers idle: each has read once, on a thread of its own \
+               that then sleeps, and keeps its handle.",
+        op: "write",
+        paced: false,
+    },
 ];
+
+/// A writer that reaches less of its rate than this is said to have fallen short.
+const KEPT_UP: f64 = 0.9;
+
+impl Group {
+    /// The writes per second the writer of this group was paced at, going by the results.
+    fn write_hz(&self, dir: &Path) -> Option<f64> {
+        if !self.paced {
+            return None;
+        }
+        rcu_bench::subjects().iter().find_map(|s| {
+            estimates(dir, self.id, s.name)
+                .values()
+                .find_map(|e| e.write_target_hz)
+        })
+    }
+
+    /// Title and description, naming the rate of a paced writer if it is known.
+    fn text(&self, write_hz: Option<f64>) -> (String, String) {
+        match write_hz {
+            Some(hz) => (
+                format!("Read beside {} writes/s", fmt_rate(hz)),
+                format!(
+                    "R readers, while a writer publishes {} times per second, the same for \
+                     every subject.",
+                    fmt_count(hz)
+                ),
+            ),
+            None => (self.title.into(), self.desc.into()),
+        }
+    }
+}
 
 /// Median time per operation in nanoseconds, with its confidence interval.
 struct Estimate {
     median: f64,
     lo: f64,
     hi: f64,
+    /// The writes per second there were meanwhile, in the read groups with a writer.
+    write_hz: Option<f64>,
+    /// The writes per second the writer was paced at, if it was.
+    write_target_hz: Option<f64>,
 }
 
-fn estimate(path: &Path) -> Option<Estimate> {
-    let json: Value = serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
+impl Estimate {
+    /// Whether a paced writer stayed clearly below its rate.
+    fn writer_short(&self) -> bool {
+        matches!((self.write_hz, self.write_target_hz), (Some(hz), Some(t)) if hz < KEPT_UP * t)
+    }
+}
+
+fn estimate(dir: &Path) -> Option<Estimate> {
+    let json: Value =
+        serde_json::from_slice(&std::fs::read(dir.join("new/estimates.json")).ok()?).ok()?;
     let m = &json["median"];
+    // written by the benchmark itself, next to criterion's files
+    let writes: Value = std::fs::read(dir.join("writes.json"))
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or(Value::Null);
     Some(Estimate {
         median: m["point_estimate"].as_f64()?,
         lo: m["confidence_interval"]["lower_bound"].as_f64()?,
         hi: m["confidence_interval"]["upper_bound"].as_f64()?,
+        write_hz: writes["hz"].as_f64(),
+        write_target_hz: writes["target_hz"].as_f64(),
     })
 }
 
@@ -542,11 +622,39 @@ fn estimates(dir: &Path, group: &str, subject: &str) -> BTreeMap<u32, Estimate> 
         let Some(readers) = entry.file_name().to_str().and_then(|n| n.parse().ok()) else {
             continue;
         };
-        if let Some(e) = estimate(&entry.path().join("new/estimates.json")) {
+        if let Some(e) = estimate(&entry.path()) {
             all.insert(readers, e);
         }
     }
     all
+}
+
+/// A whole number with thousands separators.
+fn fmt_count(n: f64) -> String {
+    let digits = format!("{:.0}", n.abs());
+    let mut out = String::new();
+    for (i, d) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(d);
+    }
+    out
+}
+
+/// A rate in short: 50k, 1M, 2.5M.
+fn fmt_rate(hz: f64) -> String {
+    let short = |v: f64, unit: &str| {
+        let v = format!("{v:.1}");
+        format!("{}{unit}", v.strip_suffix(".0").unwrap_or(&v))
+    };
+    if hz >= 999_950.0 {
+        short(hz / 1e6, "M")
+    } else if hz >= 1_000.0 {
+        short(hz / 1e3, "k")
+    } else {
+        format!("{hz:.0}")
+    }
 }
 
 fn fmt_ns(ns: f64) -> String {
@@ -584,7 +692,7 @@ fn markdown(dir: &Path) -> bool {
     for g in GROUPS {
         let rows: Vec<_> = rcu_bench::subjects()
             .into_iter()
-            .map(|s| (s.name, estimates(dir, g.0, s.name)))
+            .map(|s| (s.name, estimates(dir, g.id, s.name)))
             .filter(|(_, e)| !e.is_empty())
             .collect();
         let mut counts: Vec<u32> = rows.iter().flat_map(|(_, e)| e.keys().copied()).collect();
@@ -594,18 +702,33 @@ fn markdown(dir: &Path) -> bool {
             continue;
         }
         found = true;
-        println!("### {}\n\n{} Time per {}.\n", g.1, g.2, g.3);
+        let (title, desc) = g.text(g.write_hz(dir));
+        println!("### {title}\n\n{desc} Time per {}.\n", g.op);
         let head: Vec<_> = counts.iter().map(|c| format!("R = {c}")).collect();
         println!("| Subject | {} |", head.join(" | "));
         println!("|---|{}", "---:|".repeat(counts.len()));
+        let mut short = Vec::new();
         for (name, e) in rows {
-            let cells: Vec<_> = counts
+            let mut cells: Vec<_> = counts
                 .iter()
                 .map(|c| e.get(c).map_or("—".into(), |e| fmt_ns(e.median)))
                 .collect();
+            for (cell, c) in cells.iter_mut().zip(&counts) {
+                if let Some(e) = e.get(c).filter(|e| e.writer_short()) {
+                    let hz = fmt_count(e.write_hz.unwrap_or(0.0));
+                    short.push(format!("`{name}` at R = {c} ({hz})"));
+                    cell.push_str(" †");
+                }
+            }
             println!("| `{name}` | {} |", cells.join(" | "));
         }
         println!();
+        if !short.is_empty() {
+            println!(
+                "† The writer did not reach the rate. Writes per second it did reach: {}.\n",
+                short.join(", ")
+            );
+        }
     }
     if found {
         println!("### Idle readers and idle writers\n");
@@ -661,18 +784,20 @@ fn json(dir: &Path) -> bool {
         .map(|(s, idle)| {
             let mut results = serde_json::Map::new();
             for g in GROUPS {
-                let by_readers: serde_json::Map<_, _> = estimates(dir, g.0, s.name)
+                let by_readers: serde_json::Map<_, _> = estimates(dir, g.id, s.name)
                     .into_iter()
                     .map(|(r, e)| {
-                        (
-                            r.to_string(),
-                            json!({ "median": e.median, "lo": e.lo, "hi": e.hi }),
-                        )
+                        let mut v = json!({ "median": e.median, "lo": e.lo, "hi": e.hi });
+                        if let Some(hz) = e.write_hz {
+                            v["write_hz"] = json!(hz);
+                            v["writer_short"] = json!(e.writer_short());
+                        }
+                        (r.to_string(), v)
                     })
                     .collect();
                 if !by_readers.is_empty() {
                     found = true;
-                    results.insert(g.0.into(), by_readers.into());
+                    results.insert(g.id.into(), by_readers.into());
                 }
             }
             json!({
@@ -701,7 +826,11 @@ fn json(dir: &Path) -> bool {
         .collect();
     let groups: Vec<Value> = GROUPS
         .iter()
-        .map(|g| json!({ "id": g.0, "title": g.1, "desc": g.2, "op": g.3 }))
+        .map(|g| {
+            let write_hz = g.write_hz(dir);
+            let (title, desc) = g.text(write_hz);
+            json!({ "id": g.id, "title": title, "desc": desc, "op": g.op, "write_hz": write_hz })
+        })
         .collect();
     let doc = json!({
         "meta": {

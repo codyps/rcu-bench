@@ -118,6 +118,18 @@ td span.short { margin-left: 0.25em; }
 #chart .reflabel { fill: var(--ink-2); font-size: 11.5px; }
 #chart .whisker { stroke-width: 2; stroke-linecap: round; opacity: 0.45; }
 #chart .dot { stroke: var(--surface); stroke-width: 2; }
+#chart .tail, #chart .cap { stroke-width: 2; stroke-linecap: round; }
+#chart .under { stroke-width: 1; opacity: 0.45; }
+#chart .far { stroke-width: 1.5; stroke-dasharray: 1 4; stroke-linecap: round; opacity: 0.55; }
+#chart .slowest { fill: var(--surface); stroke-width: 1.5; opacity: 0.7; }
+#chart .floor { fill: var(--wash); }
+#chart .floorline { stroke: var(--axis); stroke-width: 1; stroke-dasharray: 3 3; }
+#chart .head { fill: var(--muted); font-size: 11.5px; }
+#chart .head.cur, #chart .val.cur { font-weight: 600; }
+#chart .val.dim { fill: var(--ink-2); }
+.key { display: flex; flex-wrap: wrap; gap: 4px 18px; color: var(--ink-2); font-size: 12.5px; margin: 0 0 8px; }
+.key span { display: inline-flex; align-items: center; gap: 6px; }
+.key svg { flex: none; }
 .note { color: var(--muted); font-size: 12.5px; margin: 10px 0 0; }
 
 #tip {
@@ -209,7 +221,7 @@ ul.caveats li { margin-bottom: 4px; }
         <div class="seg" id="readers" role="group" aria-labelledby="lbl-readers"></div>
       </div>
       <div class="control" id="ctl-stat" hidden>
-        <span id="lbl-stat">Show</span>
+        <span id="lbl-stat">Compare by</span>
         <div class="seg" id="stats" role="group" aria-labelledby="lbl-stat"></div>
       </div>
       <div class="control">
@@ -229,6 +241,7 @@ ul.caveats li { margin-bottom: 4px; }
         </div>
         <div class="legend" id="legend" role="group" aria-label="Show or hide kinds of subject"></div>
       </div>
+      <p class="key" id="chart-key" hidden></p>
       <div id="chart"></div>
       <p class="note" id="chart-note"></p>
     </section>
@@ -272,12 +285,15 @@ ul.caveats li { margin-bottom: 4px; }
         takes longer there for every subject; what differs is how much a thread that is not running holds up the others.
         A subject can stall altogether there: if its writer (or its readers) cannot get 1,000 operations done in 2 seconds, it is
         not measured and is listed as stalled.</li>
-      <li>The range drawn around each dot on the log scale is criterion's 95% confidence interval for the median.</li>
+      <li>Where no single read or write was timed, the range drawn around each dot on the log scale is criterion's 95% confidence interval for the median.</li>
       <li>The median says nothing about the slow reads and writes. For “Read beside a writer” and “Write”, every read (or write)
-        was also timed on its own for half a second, and “Show” switches to the time that 99% or 99.9% of them stayed within, or to
-        the slowest one. Each of those times includes one reading of the clock, a few tens of nanoseconds, so for the fastest
-        subjects they say more about the clock than about the read; what they are for is the stalls of microseconds and more.
-        The slowest one of a short run on a shared machine is a matter of luck.</li>
+        was also timed on its own for half a second. On the log scale each row then runs from the median to the time that 99.9%
+        of them stayed within, with a tick at 99%, and on in dots to the slowest one. “Compare by” picks which of those the rows
+        are sorted by and compared with local-rcu by, and which one the chart of the reader counts shows. Each of those times
+        includes one reading of the clock, a few tens of nanoseconds, and the shaded part of the chart is where that puts them
+        out of reach: for the fastest subjects they say more about the clock than about the read, and what they are for is the
+        stalls of microseconds and more. The slowest one is a single read or write of a short run on a shared machine, and
+        mostly a matter of which thread lost its CPU.</li>
       <li><span class="hold">◆</span> and <span class="hold">◇</span> mark subjects whose readers keep old values alive while idle.
         It is measured, not declared: the writer publishes a value, one reader reads it and then does nothing, and the writer
         publishes 100,000 more. Two things are counted afterwards: the allocations made by those writes that are still alive, and
@@ -461,7 +477,9 @@ const group = () => run().groups.find((g) => g.id === state.op);
 /* What to show of a result. "median" is criterion's time per operation. The others are in
    `each`, which the results of some operations have: every read (or write) was timed on its own
    there, and `p99`, `p999` and `max` are what 99% and 99.9% of them stayed within and the
-   slowest one. Each of those times includes one reading of the clock (`clock`). */
+   slowest one. Each of those times includes one reading of the clock (`clock`).
+   The ranked chart draws all of them in each row; the chosen one is what it sorts and compares
+   by, and what the chart of the reader counts shows. */
 const STATS = [
   { id: "median", label: "Median" },
   { id: "p99", label: "99%" },
@@ -495,20 +513,23 @@ function what(g) {
   }[state.stat];
 }
 const per = (g) => ({ median: `per ${g.op}`, p99: `for 99% of the ${g.op}s`, p999: `for 99.9% of the ${g.op}s`, max: `for the slowest ${g.op}` }[state.stat]);
-const result = (s, r) => series(s)[r == null ? state.readers : r];
+/* what was measured for a subject at the current reader count, as it is in the results */
+const measured = (s, r) => series(s, state.op)[r == null ? state.readers : r];
+/* the chosen value of a result, or null if it was not timed that way */
+const chosen = (v) => (!v ? null : state.stat === "median" ? v.median : v.each ? v.each[state.stat] : null);
+const statLabel = (id) => (id === "median" ? "median" : STATS.find((x) => x.id === id).label.toLowerCase());
 function counts(op) {
   const set = new Set();
-  for (const s of run().subjects) for (const r in series(s, op)) set.add(+r);
+  for (const s of run().subjects) for (const r in series(s, op || state.op)) set.add(+r);
   return [...set].sort((a, b) => a - b);
 }
 /* more busy threads (the readers, and the writer if there is one) than the machine has CPUs */
 const oversubscribed = (g, r) => !!(g.readers_busy && run().meta.threads && r + (g.writer_threads || 0) > run().meta.threads);
 const machineLabel = (m) => m.label || m.arch || "run";
-/* what is different about the values when they are not criterion's */
-function eachText() {
-  if (state.stat === "median") return "";
-  const r = run().subjects.map((s) => result(s)).find((r) => r && r.each);
-  return ` Every ${group().op} was timed on its own for this` + (r ? `, which adds one reading of the clock (about ${fmt(r.each.clock)}) to each.` : ".");
+/* the cost of one reading of the clock, which every single-timed read or write includes */
+function clockCost() {
+  const r = run().subjects.map((s) => measured(s)).find((r) => r && r.each);
+  return r ? r.each.clock : null;
 }
 function scenarioText() {
   const g = group();
@@ -612,17 +633,30 @@ function linearScale(max) {
 /* ---------- ranked chart ---------- */
 function renderChart() {
   const g = group();
-  $("#chart-title").textContent = `${g.title}, ${readersLabel(state.readers)}: ${what(g)}`;
-  $("#chart-desc").textContent = scenarioText() + eachText() + (state.scale === "log" ? " Log scale: each labelled gridline is 10× the one before." : "");
-
   const all = run().subjects;
+  const tails = hasEach(state.op), clock = clockCost();
+  /* the tails are drawn on the log scale only: on the linear one they would flatten every bar */
+  const ranges = tails && state.scale === "log";
+  $("#chart-title").textContent = `${g.title}, ${readersLabel(state.readers)}: time per ${g.op}` + (ranges ? ", and how slow the slow ones are" : "");
+  $("#chart-desc").textContent = scenarioText()
+    + (ranges ? ` The slow ${g.op}s come from timing every ${g.op} on its own` + (clock ? `, which adds one reading of the clock (about ${fmt(clock)}) to each: none of them can be in the shaded part.` : ".") : "")
+    + (tails && !ranges ? " The linear scale shows the median only." : "")
+    + (state.scale === "log" ? " Log scale: each labelled gridline is 10× the one before." : "");
+  renderKey(ranges, g);
+
+  /* sorted by the chosen value; a subject without it goes last, by its median */
   const rows = all
-    .filter((s) => result(s) && !state.hidden.has(s.kind))
-    .sort((a, b) => result(a).median - result(b).median);
+    .filter((s) => measured(s) && !state.hidden.has(s.kind))
+    .sort((a, b) => {
+      const av = chosen(measured(a)), bv = chosen(measured(b));
+      if (av == null || bv == null) return (av != null ? -1 : 0) - (bv != null ? -1 : 0) || measured(a).median - measured(b).median;
+      return av - bv;
+    });
   const stuck = all.filter((s) => stalledAt(s, state.readers));
-  const missing = all.filter((s) => !result(s) && !stuck.includes(s)).map((s) => s.name);
+  const missing = all.filter((s) => !measured(s) && !stuck.includes(s)).map((s) => s.name);
+  const untimed = tails ? rows.filter((s) => !measured(s).each).map((s) => s.name) : [];
   const self = all.find((s) => s.name === SELF);
-  const selfVal = self && result(self) ? result(self).median : null;
+  const selfVal = self ? chosen(measured(self)) : null;
 
   const host = $("#chart");
   host.replaceChildren();
@@ -635,17 +669,27 @@ function renderChart() {
   const W = Math.max(300, host.clientWidth);
   const narrow = W < 560;
   const labelW = narrow ? 116 : 190;
-  const valueW = narrow ? 60 : 138;
+  /* the columns of numbers: the median, the chosen value (99.9% while that is the median), and
+     the chosen value against local-rcu's */
+  const second = state.stat === "median" ? "p999" : state.stat;
+  const valueW = narrow ? 60 : tails ? 226 : 138;
+  const col2 = tails ? 80 : 58, col1 = 150;
   const padR = 6;
   const plotX = labelW + 10, plotW = W - plotX - valueW - padR - 12;
   const rowH = 26, top = 34, H = top + rows.length * rowH + 8;
 
   const scale = state.scale === "log"
-    ? logScale(Math.min(...rows.map((s) => result(s).lo)), Math.max(...rows.map((s) => result(s).hi)))
-    : linearScale(Math.max(...rows.map((s) => result(s).median)));
+    ? logScale(Math.min(...rows.map((s) => measured(s).lo)), Math.max(...rows.map((s) => { const r = measured(s); return ranges && r.each ? Math.max(r.hi, r.each.max) : r.hi; })))
+    : linearScale(Math.max(...rows.map((s) => measured(s).median)));
   const x = (v) => plotX + Math.max(0, Math.min(1, scale.pos(v))) * plotW;
 
   const root = svg("svg", { viewBox: `0 0 ${W} ${H}`, height: H, role: "list", "aria-label": `${g.title}, ${readersLabel(state.readers)}, sorted fastest first` });
+
+  /* nothing timed on its own can be faster than one reading of the clock */
+  if (ranges && clock && scale.pos(clock) > 0) {
+    root.append(svg("rect", { class: "floor", x: plotX, y: top - 6, width: x(clock) - plotX, height: H - top }));
+    root.append(svg("line", { class: "floorline", x1: x(clock), x2: x(clock), y1: top - 6, y2: H - 6 }));
+  }
 
   const majors = scale.ticks.filter((t) => t.major);
   const every = Math.ceil(majors.length / Math.max(2, Math.floor(plotW / 62)));
@@ -662,12 +706,15 @@ function renderChart() {
   }
 
   rows.forEach((s, i) => {
-    const r = result(s), y = top + i * rowH, cy = y + rowH / 2;
-    const ratio = selfVal ? r.median / selfVal : null;
+    const r = measured(s), y = top + i * rowH, cy = y + rowH / 2;
+    const ratio = selfVal && chosen(r) != null ? chosen(r) / selfVal : null;
+    const color = kindColor(s.kind);
     const row = svg("g", {
       class: "row" + (s.name === state.pinned ? " pinned" : ""),
       tabindex: 0, role: "listitem",
-      "aria-label": `${s.name}: ${fmt(r.median)}` + (ratio && s.name !== SELF ? `, ${fmtRatio(ratio)} local-rcu` : "")
+      "aria-label": `${s.name}: ${fmt(r.median)}`
+        + (r.each ? `, 99% within ${fmt(r.each.p99)}, 99.9% within ${fmt(r.each.p999)}, slowest ${fmt(r.each.max)}` : "")
+        + (ratio && s.name !== SELF ? `, ${fmtRatio(ratio)} local-rcu` : "")
         + holdAria(s) + batchAria(s) + (copies(s) ? ", only holds Copy values" : "")
         + (r.writer_short ? `, the writer only made ${writesText(r)}` : ""),
     });
@@ -679,20 +726,36 @@ function renderChart() {
 
     if (state.scale === "log") {
       const x1 = x(r.lo), x2 = x(r.hi);
-      if (x2 - x1 > 1) row.append(svg("line", { class: "whisker", x1, x2, y1: cy, y2: cy, stroke: kindColor(s.kind) }));
-      row.append(svg("circle", { class: "dot", cx: x(r.median), cy, r: 6, fill: kindColor(s.kind) }));
+      if (ranges && r.each) {
+        /* median to 99.9% as a line with a tick at 99%, then dots out to the slowest one */
+        const e = r.each, xm = x(r.median), x99 = x(e.p99), x999 = x(e.p999), xmax = x(e.max);
+        /* the stretch below one reading of the clock is drawn thin: that much of the distance
+           from the median is the clock's doing, not the subject's */
+        const from = Math.min(xm, x99), solid = clock ? Math.max(from, Math.min(x(clock), x99)) : from;
+        if (solid - from > 1) row.append(svg("line", { class: "under", x1: from, x2: solid, y1: cy, y2: cy, stroke: color }));
+        row.append(svg("line", { class: "tail", x1: solid, x2: Math.max(xm, x999), y1: cy, y2: cy, stroke: color }));
+        if (xmax - x999 > 6) row.append(svg("line", { class: "far", x1: x999 + 4, x2: xmax - 4, y1: cy, y2: cy, stroke: color }));
+        row.append(svg("line", { class: "cap", x1: x99, x2: x99, y1: cy - 4, y2: cy + 4, stroke: color }));
+        row.append(svg("line", { class: "cap", x1: x999, x2: x999, y1: cy - 7, y2: cy + 7, stroke: color }));
+        row.append(svg("circle", { class: "slowest", cx: xmax, cy, r: 3.5, stroke: color }));
+      } else if (x2 - x1 > 1) row.append(svg("line", { class: "whisker", x1, x2, y1: cy, y2: cy, stroke: color }));
+      row.append(svg("circle", { class: "dot", cx: x(r.median), cy, r: 6, fill: color }));
     } else {
       const w = Math.max(1.5, x(r.median) - plotX), h = 12, rad = Math.min(4, w);
       const d = `M${plotX},${cy - h / 2} h${w - rad} a${rad},${rad} 0 0 1 ${rad},${rad} v${h - 2 * rad} a${rad},${rad} 0 0 1 ${-rad},${rad} h${-(w - rad)} z`;
       row.append(svg("path", { d, fill: kindColor(s.kind) }));
     }
 
-    const vx = W - padR;
-    if (!narrow && ratio && s.name !== SELF) {
-      row.append(svg("text", { class: "ratio", x: vx, y: cy + 4, "text-anchor": "end" }, fmtRatio(ratio)));
-      row.append(svg("text", { class: "val", x: vx - 58, y: cy + 4, "text-anchor": "end" }, fmt(r.median)));
+    const vx = W - padR, ty = cy + 4;
+    const cur = (id) => (tails && state.stat === id ? " cur" : "");
+    if (narrow) {
+      row.append(svg("text", { class: "val", x: vx, y: ty, "text-anchor": "end" }, chosen(r) != null ? fmt(chosen(r)) : "n/a"));
     } else {
-      row.append(svg("text", { class: "val", x: narrow ? vx : vx - 58, y: cy + 4, "text-anchor": "end" }, fmt(r.median)));
+      if (ratio && s.name !== SELF) row.append(svg("text", { class: "ratio", x: vx, y: ty, "text-anchor": "end" }, fmtRatio(ratio)));
+      if (tails) {
+        row.append(svg("text", { class: "val" + cur(second) + (cur(second) ? "" : " dim"), x: vx - col2, y: ty, "text-anchor": "end" }, r.each ? fmt(r.each[second]) : "n/a"));
+        row.append(svg("text", { class: "val" + cur("median") + (cur("median") ? "" : " dim"), x: vx - col1, y: ty, "text-anchor": "end" }, fmt(r.median)));
+      } else row.append(svg("text", { class: "val", x: vx - col2, y: ty, "text-anchor": "end" }, fmt(r.median)));
     }
 
     const show = (ev) => showRowTip(s, ratio, ev, row);
@@ -705,18 +768,44 @@ function renderChart() {
     root.append(row);
   });
 
-  if (!narrow) root.append(svg("text", { class: "tick", x: W - padR, y: top - 12, "text-anchor": "end" }, "vs local-rcu"));
+  if (!narrow) {
+    root.append(svg("text", { class: "head", x: W - padR, y: top - 12, "text-anchor": "end" }, "vs local-rcu"));
+    if (tails) {
+      root.append(svg("text", { class: "head" + (state.stat === second ? " cur" : ""), x: W - padR - col2, y: top - 12, "text-anchor": "end" }, statLabel(second)));
+      root.append(svg("text", { class: "head" + (state.stat === "median" ? " cur" : ""), x: W - padR - col1, y: top - 12, "text-anchor": "end" }, "median"));
+    }
+  }
   host.append(root);
   fitNames(root, "text.name", labelW - 4);
 
   const notes = [];
-  if (selfVal != null && selfShown) notes.push("The vertical line marks local-rcu.");
+  if (selfVal != null && selfShown) notes.push(`The vertical line marks local-rcu${tails && state.stat !== "median" ? `'s ${statLabel(state.stat)}` : ""}.`);
+  if (untimed.length) notes.push(`No single ${g.op} of ${untimed.join(", ")} was timed, so ${untimed.length > 1 ? "they have" : "it has"} a median only.`);
   if (missing.length) notes.push(`Not measured here: ${missing.join(", ")}.`);
   if (stuck.length) notes.push(`Stalled, so not measured: ${stuck.map((s) => { const v = stalledAt(s, state.readers); return `${s.name} (${v.done} ${g.op}${v.done === 1 ? "" : "s"} in ${v.secs} s)`; }).join(", ")}. Beside that many threads the ${g.op === "write" ? "writer" : "readers"} got next to nowhere.`);
-  const short = rows.filter((s) => result(s).writer_short);
-  if (short.length) notes.push(`${SHORT} The writer did not reach ${fmtRate(g.write_hz)} writes per second: ${short.map((s) => `${s.name} (${fmtRate(result(s).write_hz)})`).join(", ")}.`);
+  const short = rows.filter((s) => measured(s).writer_short);
+  if (short.length) notes.push(`${SHORT} The writer did not reach ${fmtRate(g.write_hz)} writes per second: ${short.map((s) => `${s.name} (${fmtRate(measured(s).write_hz)})`).join(", ")}.`);
   $("#chart-note").textContent = notes.join(" ");
   holdKey($("#chart-note"), rows);
+}
+/* what the marks of a row are, drawn the way the rows draw them */
+function renderKey(shown, g) {
+  const host = $("#chart-key");
+  host.hidden = !shown;
+  host.replaceChildren();
+  if (!shown) return;
+  const c = "var(--ink-2)";
+  const item = (text, ...shapes) => {
+    const pic = svg("svg", { width: 26, height: 16, viewBox: "0 0 26 16", "aria-hidden": "true" });
+    pic.append(...shapes);
+    const span = el("span");
+    span.append(pic, text);
+    host.append(span);
+  };
+  item("median", svg("circle", { cx: 13, cy: 8, r: 5, fill: c }));
+  item(`99% of the ${g.op}s within`, svg("line", { x1: 2, x2: 24, y1: 8, y2: 8, stroke: c, "stroke-width": 2 }), svg("line", { x1: 13, x2: 13, y1: 4, y2: 12, stroke: c, "stroke-width": 2, "stroke-linecap": "round" }));
+  item("99.9% within", svg("line", { x1: 2, x2: 13, y1: 8, y2: 8, stroke: c, "stroke-width": 2 }), svg("line", { x1: 13, x2: 13, y1: 1, y2: 15, stroke: c, "stroke-width": 2, "stroke-linecap": "round" }));
+  item(`the slowest one`, svg("line", { x1: 2, x2: 14, y1: 8, y2: 8, stroke: c, "stroke-width": 1.5, "stroke-dasharray": "1 4", "stroke-linecap": "round" }), svg("circle", { cx: 20, cy: 8, r: 3.5, fill: "none", stroke: c, "stroke-width": 1.5 }));
 }
 function fitNames(root, sel, max) {
   for (const t of root.querySelectorAll(sel)) {
@@ -864,14 +953,18 @@ function placeTip(ev, anchor) {
   tip.style.top = topPx + "px";
 }
 function showRowTip(s, ratio, ev, anchor) {
-  const r = result(s), g = group();
-  const tip = tipHead(s, `${fmt(r.median)} ${per(g)}`);
+  const r = measured(s), g = group();
+  const tip = tipHead(s, `${fmt(r.median)} per ${g.op}`);
   const dl = el("dl");
   const add = (k, v) => { dl.append(el("dt", {}, k), el("dd", {}, v)); };
   if (r.lo !== r.hi) add("95% CI", `${fmt(r.lo)} – ${fmt(r.hi)}`);
-  if (r.each) add(`Slow ${g.op}s`, `99% within ${fmt(r.each.p99)}, 99.9% within ${fmt(r.each.p999)}, slowest ${fmt(r.each.max)}`);
+  if (r.each) {
+    add("99% within", fmt(r.each.p99));
+    add("99.9% within", fmt(r.each.p999));
+    add("Slowest", fmt(r.each.max));
+  }
   if (r.write_hz != null) add("Writes", writesText(r));
-  if (ratio && s.name !== SELF) add("vs local-rcu", ratio >= 1 ? `${fmtRatio(ratio)} slower` : `${fmtRatio(1 / ratio)} faster`);
+  if (ratio && s.name !== SELF) add(state.stat === "median" ? "vs local-rcu" : `vs local-rcu, ${statLabel(state.stat)}`, ratio >= 1 ? `${fmtRatio(ratio)} slower` : `${fmtRatio(1 / ratio)} faster`);
   add("Kind", kindLabel(s.kind));
   if (copies(s)) add("Values", "Copy types only; a read copies the value out");
   if (idleText(s)) add("Idle reader", idleText(s));
@@ -928,11 +1021,20 @@ function renderTable() {
     { id: "rest-values", label: "Old values held when writes stop", val: (s) => s.idle && s.idle.values_at_rest, text: restTip, mark: batch },
     { id: "rest", label: "Allocations left when writes stop", val: (s) => s.idle && s.idle.left_at_rest, text: restTip, mark: batch },
   ].filter((c) => run().subjects.some((s) => c.val(s) != null));
+  /* the slow reads or writes at the current reader count, where every one was timed */
+  const tailCols = !hasEach(state.op) ? [] : STATS.filter((x) => x.id !== "median").map((x) => ({
+    id: x.id, time: true, label: `${x.label}, ${readersLabel(state.readers)}`,
+    val: (s) => { const v = measured(s); return v && v.each ? v.each[x.id] : null; },
+    text: () => (x.id === "max" ? `The slowest ${group().op}` : `${x.label} of the ${group().op}s took no longer`) + `, with ${readersLabel(state.readers)}.`,
+    mark: () => null,
+  }));
+  for (const c of tailCols) mk(c.label, c.id);
   for (const c of extra) mk(c.label, c.id);
+  const more = [...tailCols, ...extra];
   thead.append(tr);
 
   const subjects = run().subjects.filter((s) => !state.hidden.has(s.kind));
-  const sortExtra = extra.find((c) => c.id === state.sort.col);
+  const sortExtra = more.find((c) => c.id === state.sort.col);
   const sortable = state.sort.col === "name" || sortExtra || cs.includes(state.sort.col);
   const col = state.sort.col != null && sortable ? state.sort.col : state.readers;
   const dir = state.sort.col === col ? state.sort.dir : 1;
@@ -943,7 +1045,7 @@ function renderTable() {
       if (av == null || bv == null) return (av != null ? -1 : 0) - (bv != null ? -1 : 0);
       return dir * (av - bv) || a.name.localeCompare(b.name);
     }
-    const av = series(a)[col], bv = series(b)[col];
+    const av = measured(a, col), bv = measured(b, col);
     if (!av || !bv) return (av ? -1 : 0) - (bv ? -1 : 0);
     return dir * (av.median - bv.median);
   });
@@ -959,7 +1061,7 @@ function renderTable() {
     firstCell.title = s.desc;
     row.append(firstCell);
     for (const r of cs) {
-      const v = series(s)[r];
+      const v = measured(s, r);
       const td = el("td", {}, v ? fmt(v.median) : stalledAt(s, r) ? "stalled" : "—");
       if (stalledAt(s, r)) td.title = `Not measured: ${stalledAt(s, r).done} ${group().op}${stalledAt(s, r).done === 1 ? "" : "s"} in ${stalledAt(s, r).secs} s.`;
       if (!v) td.classList.add("none");
@@ -970,9 +1072,9 @@ function renderTable() {
       if (r === state.readers) td.classList.add("cur");
       row.append(td);
     }
-    for (const c of extra) {
+    for (const c of more) {
       const v = c.val(s);
-      const td = el("td", {}, v != null ? fmtCount(v) : "—");
+      const td = el("td", {}, v != null ? (c.time ? fmt(v) : fmtCount(v)) : "—");
       if (v == null) td.classList.add("none");
       else td.title = c.text(s);
       if (c.mark(s)) td.classList.add(c.mark(s));
@@ -984,7 +1086,8 @@ function renderTable() {
   $("#table-title").textContent = `${group().title}: all reader counts`;
   const desc = $("#table-desc");
   desc.textContent = "Median time per operation. Click a column to sort by it, click a row to pin it in the charts.";
-  if (subjects.some((s) => Object.values(series(s)).some((v) => v.writer_short))) {
+  if (tailCols.length) desc.append(` The columns after the reader counts are the slow ${group().op}s with ${readersLabel(state.readers)}: the time 99% and 99.9% of them stayed within, and the slowest one.`);
+  if (subjects.some((s) => Object.values(series(s, state.op)).some((v) => v.writer_short))) {
     desc.append(` ${SHORT} The writer did not reach ${fmtRate(group().write_hz)} writes per second; hover for what it reached.`);
   }
   if (extra.length) {

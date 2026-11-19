@@ -256,6 +256,9 @@ ul.caveats li { margin-bottom: 4px; }
         <a href="https://github.com/codyps/local-rcu/blob/main/COMPARISONS.md">COMPARISONS.md</a> describes the differences.</li>
       <li>The writer in “Read beside a writer” publishes continuously, and the readers in “Write” read continuously.
         Both are far harsher than a typical read-mostly workload.</li>
+      <li>In “Read beside a writer” a subject with cheap writes gets more of them, and its readers pay for each one, so its reads
+        can look slower than those of a subject with a slow writer. “Read beside a paced writer” gives every subject the same
+        50,000 writes per second (a writer too slow for that writes as fast as it can).</li>
       <li>The CI machines have 4 CPUs. Reads without a writer go up to 4 readers; with a writer the sweep stops at 3 so the writer has a CPU of its own.</li>
       <li>The range drawn around each dot on the log scale is criterion's 95% confidence interval for the median.</li>
       <li><span class="hold">◆</span> and <span class="hold">◇</span> mark subjects whose readers keep old values alive while idle.

@@ -494,6 +494,13 @@ const GROUPS: &[(&str, &str, &str, &str)] = &[
         "read",
     ),
     (
+        "read-paced",
+        "Read beside a paced writer",
+        "R readers, while a writer publishes at a fixed rate, the same for every subject \
+         (50,000 writes per second unless RCU_BENCH_WRITE_HZ was set).",
+        "read",
+    ),
+    (
         "write",
         "Write",
         "The writer, while R readers read as fast as they can.",

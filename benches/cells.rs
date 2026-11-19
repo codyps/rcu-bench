@@ -4,6 +4,8 @@
 //!
 //! - `read`:        R readers, no writer
 //! - `read-writer`: R readers, while a writer publishes as fast as it can
+//! - `read-paced`:  R readers, while a writer publishes at a fixed rate, the same for every
+//!   subject (`RCU_BENCH_WRITE_HZ` writes per second, 50000 by default)
 //! - `write`:       the writer, while R readers read as fast as they can (R starts at 0)
 //! - `write-idle`:  the writer, while R readers do nothing: each has read once, on a thread
 //!   of its own that then sleeps, and keeps its handle
@@ -16,15 +18,22 @@
 //! Idle readers need no CPU, so `write-idle` has a cap of its own: `RCU_BENCH_MAX_IDLE`, 64
 //! by default.
 //!
+//! In `read-writer` a subject with cheap writes gets more of them, and its readers pay for
+//! every one (a cache miss on the new value, at least), so its reads look slower than those of
+//! a subject whose writer is slow. `read-paced` gives every subject the same number of writes
+//! per second. The writer spins between writes instead of sleeping, to stay on its CPU and on
+//! time. A writer that cannot keep up writes as fast as it can, and is named on stderr.
+//!
 //! Read groups report the time per read as seen by one reader (averaged over the readers).
 //! The write group reports the time per write.
 
 use criterion::measurement::WallTime;
 use criterion::{criterion_group, criterion_main, BenchmarkGroup, BenchmarkId, Criterion};
 use rcu_bench::{for_each_subject, Subject, Val};
+use std::collections::HashSet;
 use std::hint::black_box;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Barrier};
+use std::sync::{Arc, Barrier, Mutex};
 use std::time::{Duration, Instant};
 
 fn max_readers() -> usize {
@@ -51,8 +60,82 @@ fn idle_counts() -> Vec<usize> {
     [1, 4, 16, 64].into_iter().filter(|&r| r <= max).collect()
 }
 
+/// The time from one write to the next in `read-paced`.
+fn write_interval() -> Duration {
+    let hz: f64 = match std::env::var("RCU_BENCH_WRITE_HZ") {
+        Ok(v) => v.parse().expect("RCU_BENCH_WRITE_HZ must be a number"),
+        Err(_) => 50_000.0,
+    };
+    assert!(hz > 0.0, "RCU_BENCH_WRITE_HZ must be above 0");
+    Duration::from_secs_f64(1.0 / hz)
+}
+
+/// What the writer does while the readers are measured.
+#[derive(Clone, Copy)]
+enum WriterLoad {
+    /// There is no writer thread.
+    None,
+    /// Publish as fast as possible.
+    Flat,
+    /// Publish once per interval: the same rate for every subject.
+    Paced(Duration),
+}
+
+/// Says once per benchmark that a paced writer did not reach its rate.
+fn warn_behind(
+    name: &'static str,
+    readers: usize,
+    interval: Duration,
+    writes: u64,
+    took: Duration,
+) {
+    static WARNED: Mutex<Option<HashSet<(&'static str, usize)>>> = Mutex::new(None);
+    let wanted = took.as_secs_f64() / interval.as_secs_f64();
+    // short runs (criterion's warm up) say little
+    if wanted < 1000.0 || writes as f64 >= 0.9 * wanted {
+        return;
+    }
+    let mut warned = WARNED.lock().unwrap();
+    if warned
+        .get_or_insert_with(HashSet::new)
+        .insert((name, readers))
+    {
+        eprintln!(
+            "read-paced/{name}/{readers}: the writer cannot keep up: {:.0} writes per second \
+             instead of {:.0}",
+            writes as f64 / took.as_secs_f64(),
+            1.0 / interval.as_secs_f64(),
+        );
+    }
+}
+
+/// Publishes once per `interval` until `stop`, spinning in between. The times to write at are
+/// fixed from the start, so a writer that falls behind (it was descheduled, or one write took
+/// long) writes without a pause until it has caught up: what is the same for every subject is
+/// the number of writes the readers see. A writer that is always behind never pauses.
+/// Returns the number of writes and the time they took.
+fn paced_writes<S: Subject>(
+    w: &mut S::Writer,
+    interval: Duration,
+    stop: &AtomicBool,
+) -> (u64, Duration) {
+    let mut writes = 0;
+    let start = Instant::now();
+    let mut next = start + interval;
+    while !stop.load(Ordering::Relaxed) {
+        writes += 1;
+        S::write(w, Val::new(writes));
+        while Instant::now() < next && !stop.load(Ordering::Relaxed) {
+            std::hint::spin_loop();
+        }
+        next += interval;
+    }
+    (writes, start.elapsed())
+}
+
 /// `readers` threads each do `iters` reads. Returns the mean time one reader took.
-fn run_read<S: Subject>(iters: u64, readers: usize, with_writer: bool) -> Duration {
+fn run_read<S: Subject>(iters: u64, readers: usize, load: WriterLoad) -> Duration {
+    let with_writer = !matches!(load, WriterLoad::None);
     let (mut w, rs) = S::new(Val::new(0), readers);
     let start = Arc::new(Barrier::new(readers + usize::from(with_writer)));
     let stop = Arc::new(AtomicBool::new(false));
@@ -79,6 +162,11 @@ fn run_read<S: Subject>(iters: u64, readers: usize, with_writer: bool) -> Durati
         let stop = stop.clone();
         let t = std::thread::spawn(move || {
             start.wait();
+            if let WriterLoad::Paced(interval) = load {
+                let (writes, took) = paced_writes::<S>(&mut w, interval, &stop);
+                warn_behind(S::NAME, readers, interval, writes, took);
+                return;
+            }
             let mut i = 0;
             while !stop.load(Ordering::Relaxed) {
                 i += 1;
@@ -173,13 +261,13 @@ fn run_write_idle<S: Subject>(iters: u64, idle: usize) -> Duration {
     elapsed
 }
 
-fn read_one<S: Subject>(g: &mut BenchmarkGroup<'_, WallTime>, counts: &[usize], with_writer: bool) {
+fn read_one<S: Subject>(g: &mut BenchmarkGroup<'_, WallTime>, counts: &[usize], load: WriterLoad) {
     for &readers in counts {
         if readers > S::MAX_READERS {
             continue;
         }
         g.bench_function(BenchmarkId::new(S::NAME, readers), |b| {
-            b.iter_custom(|iters| run_read::<S>(iters, readers, with_writer))
+            b.iter_custom(|iters| run_read::<S>(iters, readers, load))
         });
     }
 }
@@ -199,11 +287,11 @@ fn write_one<S: Subject>(g: &mut BenchmarkGroup<'_, WallTime>, counts: &[usize],
     }
 }
 
-fn read_group(c: &mut Criterion, name: &str, counts: &[usize], with_writer: bool) {
+fn read_group(c: &mut Criterion, name: &str, counts: &[usize], load: WriterLoad) {
     let mut g = c.benchmark_group(name);
     macro_rules! one {
         ($t:ty) => {
-            read_one::<$t>(&mut g, counts, with_writer);
+            read_one::<$t>(&mut g, counts, load);
         };
     }
     for_each_subject!(one);
@@ -228,8 +316,10 @@ fn benches(c: &mut Criterion) {
     let mut for_write = vec![0];
     for_write.extend(&beside_writer);
 
-    read_group(c, "read", &alone, false);
-    read_group(c, "read-writer", &beside_writer, true);
+    read_group(c, "read", &alone, WriterLoad::None);
+    read_group(c, "read-writer", &beside_writer, WriterLoad::Flat);
+    let paced = WriterLoad::Paced(write_interval());
+    read_group(c, "read-paced", &beside_writer, paced);
     write_group(c, "write", &for_write, false);
     write_group(c, "write-idle", &idle_counts(), true);
 }

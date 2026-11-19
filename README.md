@@ -24,7 +24,8 @@ cargo run --release --bin report       # markdown tables from target/criterion
 
 `RCU_BENCH_MAX_READERS` caps the number of reader threads. By default it is
 the number of CPUs, at most 8. `RCU_BENCH_MAX_IDLE` caps the number of idle
-readers in `write-idle`, 64 by default.
+readers in `write-idle`, 64 by default. `RCU_BENCH_WRITE_HZ` sets the writes
+per second in `read-paced`, 50,000 by default.
 
 To look at your own run in the results page:
 
@@ -46,11 +47,23 @@ up to the cap), so the results show how each subject scales:
 |---|---|---|
 | `read` | R readers | time per read, as seen by one reader |
 | `read-writer` | R readers + a writer publishing as fast as it can | time per read, as seen by one reader |
+| `read-paced` | R readers + a writer publishing at a fixed rate | time per read, as seen by one reader |
 | `write` | the writer + R readers reading as fast as they can (R starts at 0) | time per write |
 | `write-idle` | the writer + R idle readers (R = 1, 4, 16, 64) | time per write |
 
 The groups with a writer stop one reader short of the cap, so the writer has a
 CPU of its own.
+
+In `read-writer` the writers do not all do the same work: a subject with cheap
+writes gets more of them, and its readers pay for every one (a cache miss on
+the new value, at least). Its reads then look slower than those of a subject
+whose writer is slow. `read-paced` takes that out by giving every subject the
+same number of writes: `RCU_BENCH_WRITE_HZ` per second, 50,000 by default.
+The writer spins between writes instead of sleeping, so that it stays on its
+CPU and on time, and catches up without a pause after falling behind. A
+writer that cannot reach the rate at all writes as fast as it can and is named
+on stderr with the rate it did reach; its `read-paced` result is then for
+fewer writes than the others had.
 
 An idle reader in `write-idle` has read once, on a thread of its own, and that
 thread then sleeps without giving up its handle. It uses no CPU, so R is not

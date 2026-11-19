@@ -23,10 +23,13 @@ cargo run --release --bin report       # markdown tables from target/criterion
 ```
 
 `RCU_BENCH_MAX_READERS` caps the number of reader threads. By default it is
-the number of CPUs, at most 8. `RCU_BENCH_MAX_IDLE` caps the number of idle
-readers in `write-idle`, 64 by default. `RCU_BENCH_WRITE_HZ` and
-`RCU_BENCH_FAST_WRITE_HZ` set the writes per second in `read-paced` and
-`read-paced-fast`, 50,000 and 1,000,000 by default.
+the number of CPUs, at most 8. `RCU_BENCH_OVERSUBSCRIBED` is the number of
+readers in the extra, oversubscribed run of `read-writer` and `write`: twice
+the number of CPUs by default, 0 for none. `RCU_BENCH_MAX_IDLE` caps the number of idle
+readers in `write-idle`, 64 by default. `RCU_BENCH_WRITE_HZ` sets the writes
+per second in `read-paced`, 1,000,000 by default. `RCU_BENCH_HOLD_US` sets the
+microseconds a reader stays in each read in `write-held`, 10 by default; set
+it for `report` as well, which names the group after it.
 
 To look at your own run in the results page:
 
@@ -49,27 +52,55 @@ up to the cap), so the results show how each subject scales:
 | `read` | R readers | time per read, as seen by one reader |
 | `read-writer` | R readers + a writer publishing as fast as it can | time per read, as seen by one reader |
 | `read-paced` | R readers + a writer publishing at a fixed rate | time per read, as seen by one reader |
-| `read-paced-fast` | the same at a higher rate | time per read, as seen by one reader |
 | `write` | the writer + R readers reading as fast as they can (R starts at 0) | time per write |
 | `write-idle` | the writer + R idle readers (R = 1, 4, 16, 64) | time per write |
+| `write-held` | the writer + R readers that stay in every read for a fixed time | time per write |
 
 The groups with a writer stop one reader short of the cap, so the writer has a
 CPU of its own.
 
+`read-writer` and `write` are measured once more with twice as many readers
+as there are CPUs. The threads then take turns, and the scheduler takes a
+reader or the writer off its CPU in the middle of a read or a write. A thread
+that waits for one that is not running (for a lock it holds, or for it to
+leave its read) waits for a whole time slice. Reads are timed by the clock, so
+every subject's reads take longer there, by about the share of a CPU a reader
+still gets; compare the subjects with each other, not with the other columns.
+The report and the results page say which columns these are.
+
+Some subjects get nowhere at all with that many threads: a writer that needs a
+moment with no reader in its way may never find one. So before an
+oversubscribed benchmark runs, the threads it would time get 2 seconds for
+1,000 operations. If that is not enough the benchmark is not run, and the
+report and the page show it as stalled, with how far it got.
+
+Criterion times many operations in a row and reports the time per operation,
+which hides the slow ones. `read-writer` and `write` are therefore run once
+more after criterion is done, with every read (or write) timed on its own, for
+half a second (`RCU_BENCH_TAIL_MS`, 0 for not at all). The report and the page
+show the time that 99% and 99.9% of them stayed within, and the slowest one.
+Each of those times includes one reading of the clock (the end of one
+operation is the start of the next), a few tens of nanoseconds: for the
+fastest subjects that is most of it, and timed readers also read less often
+than the ones criterion measures. These numbers are for the stalls of
+microseconds and more. The loop is closed, so one stall counts once, however
+many operations would have fallen into it; and the slowest operation of half a
+second on a shared machine is largely luck.
+
 In `read-writer` the writers do not all do the same work: a subject with cheap
 writes gets more of them, and its readers pay for every one (a cache miss on
 the new value, at least). Its reads then look slower than those of a subject
-whose writer is slow. The paced groups take that out by giving every subject
-the same number of writes per second: 50,000 in `read-paced`, where most
-readers hardly notice the writer, and 1,000,000 in `read-paced-fast`, where
-they do but the slowest writers no longer keep up. The writer spins between
-writes instead of sleeping, so that it stays on its CPU and on time, and
-catches up without a pause after falling behind. A writer that cannot reach
-the rate at all writes as fast as it can.
+whose writer is slow. `read-paced` takes that out by giving every subject the
+same number of writes per second: 1,000,000, which the readers notice but the
+slowest writers do not keep up with. (At 50,000 writes per second the results
+were those of `read`, so that rate is no longer measured.) The writer spins
+between writes instead of sleeping, so that it stays on its CPU and on time,
+and catches up without a pause after falling behind. A writer that cannot
+reach the rate at all writes as fast as it can.
 
 Every read group with a writer records the writes per second there really
 were (`writes.json`, next to criterion's results). The report and the results
-page show them, name the paced groups after the rate they ran at, and mark
+page show them, name the paced group after the rate it ran at, and mark
 with † the results where the writer reached less than 90% of it: those are for
 fewer writes than the others had.
 
@@ -79,6 +110,18 @@ tied to the number of CPUs (`RCU_BENCH_MAX_IDLE` caps it, 64 by default). What
 this shows is how the cost of a write grows with the number of readers that
 merely exist: a writer that looks at every reader, or at every thread known to
 a collector, pays for each of them.
+
+A reader in `write-held` does not give up its access to the value (guard,
+lock, borrow, `Arc`, ...) right after looking at it: it spins for 10 µs with
+the access kept, gives it up, and reads again at once. So every reader is
+inside a read nearly all of the time, and the time per write shows what that
+costs the writer: one that waits for the readers to leave pays for the time
+they stay (and for being woken up, if it sleeps meanwhile), one that only sets
+the old value aside pays nothing extra, and a reader that holds an `Arc` or a
+copy does not hold the writer up at all. A lock that lets a waiting writer in
+ahead of the readers can look cheap here with several readers: the writer
+then gets many writes done while the readers are still being woken up. What
+the old values that pile up meanwhile cost in memory is not measured.
 
 A read includes getting access (guard, lock, `Arc` clone, ...), looking at the
 value, and releasing access again. A write includes allocating the new value
@@ -119,10 +162,11 @@ and whatever the crate does about the old one.
 | `sdd` | `sdd` | `AtomicOwned`; a `Guard` per read, a `Guard` and a `swap` per write (a thread only frees what it retired when it creates guards) |
 | `haphazard` | `haphazard` | `AtomicPtr`, one `HazardPointer` kept per reader; `retire` per write |
 | `kovan` | `kovan` | `Atom::load`, `store` |
-| `kovan-raw` | `kovan` | the lower level API, as in `kovan`'s own benchmarks: an `Atomic` of a node that embeds a `RetiredNode`; `pin` + `load` per read, `swap` + `retire` per write |
 
 Not included:
 
+- `kovan`'s lower level API (`Atomic`, `pin`, `retire`, as in its own
+  benchmarks) was measured next to `Atom` and gave the same results.
 - `atom_box` 0.3.0 does not compile with current Rust (1.99).
 - `rcu_128` needs the unstable `integer_atomics` feature and a target with
   128-bit atomics.
@@ -147,8 +191,9 @@ Not included:
   fastest.
 - The writer in `read-writer` publishes continuously, and the readers in
   `write` read continuously. Both are far from a typical "read mostly" load.
-- Readers here release access right after every read. Nothing measures the
-  cost of a reader that holds a guard for a long time.
+- Except in `write-held`, readers release access right after every read. And
+  `write-held` only has readers that hold on for microseconds: nothing
+  measures a reader that keeps a guard for seconds, or that never lets go.
 - `report` does check what a reader that has gone *idle* holds back: the
   writer publishes a value, one reader reads it and then does nothing, and
   the writer publishes 100,000 more. It then counts the allocations made by
@@ -183,7 +228,7 @@ runs with [`scripts/merge_results.py`](scripts/merge_results.py), and publishes
 [`site/`](site) to GitHub Pages. The page has a machine switch.
 
 Those runners have 4 CPUs and noisy neighbours, so the sweep is short (up to 4
-readers alone, 3 beside a writer) and the numbers are rougher than a run on a
+readers alone, 3 beside a writer, and 8 for the oversubscribed run) and the numbers are rougher than a run on a
 quiet machine.
 
 To add a self-hosted machine, register a runner for this repository and set the
@@ -194,7 +239,8 @@ on pushes to `main`, on a schedule and by hand, never for pull requests.
 ## Adding a subject
 
 1. Add the crate to `Cargo.toml` and a module in `src/subjects/` implementing
-   `Subject` (name, kind, a one-line description, and the three operations).
+   `Subject` (name, kind, a one-line description, and the three operations:
+   `new`, `read_with` and `write`).
 2. List it in `for_each_subject!` in `src/lib.rs`.
    Set `COPY_ONLY` if the crate can only hold `Copy` values.
 3. `cargo test --release` checks it sequentially and concurrently.

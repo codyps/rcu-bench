@@ -18,6 +18,18 @@ fn sequential<S: Subject>() {
     }
 }
 
+/// `read_with` hands over the same value as `read`, and gives up its access before it returns:
+/// a write right after it must not wait for anything.
+fn held<S: Subject>() {
+    let (mut w, mut rs) = S::new(Val::new(7), 1);
+    let r = &mut rs[0];
+    for i in 100..200 {
+        S::write(&mut w, Val::new(i));
+        let seen = S::read_with(r, |v| *v);
+        assert_eq!(seen, Val::new(i), "{}: value in read_with", S::NAME);
+    }
+}
+
 fn concurrent<S: Subject>() {
     const LAST: u64 = 20_000;
     let (mut w, rs) = S::new(Val::new(0), 3.min(S::MAX_READERS));
@@ -56,6 +68,16 @@ fn every_subject_sequential() {
     macro_rules! one {
         ($t:ty) => {
             sequential::<$t>();
+        };
+    }
+    for_each_subject!(one);
+}
+
+#[test]
+fn every_subject_held() {
+    macro_rules! one {
+        ($t:ty) => {
+            held::<$t>();
         };
     }
     for_each_subject!(one);

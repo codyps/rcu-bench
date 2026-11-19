@@ -632,6 +632,7 @@ dependencies = [
  "local-rcu",
  "rcu_cell",
  "read-copy-update",
+ "regex",
  "sdd",
  "seize",
  "seqlock",

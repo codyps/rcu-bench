@@ -16,8 +16,8 @@ impl Subject for LocalRcu {
     }
 
     #[inline]
-    fn read(r: &mut Self::Reader) -> u64 {
-        r.read().get()
+    fn read_with<T>(r: &mut Self::Reader, f: impl FnOnce(&Val) -> T) -> T {
+        f(&r.read())
     }
 
     #[inline]
@@ -44,8 +44,8 @@ impl Subject for LocalRcuCached {
     }
 
     #[inline]
-    fn read(r: &mut Self::Reader) -> u64 {
-        r.read().get()
+    fn read_with<T>(r: &mut Self::Reader, f: impl FnOnce(&Val) -> T) -> T {
+        f(r.read())
     }
 
     #[inline]
@@ -87,8 +87,8 @@ impl Subject for LocalRcuBatched {
     }
 
     #[inline]
-    fn read(r: &mut Self::Reader) -> u64 {
-        r.read().get()
+    fn read_with<T>(r: &mut Self::Reader, f: impl FnOnce(&Val) -> T) -> T {
+        f(&r.read())
     }
 
     #[inline]

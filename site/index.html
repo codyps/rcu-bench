@@ -208,6 +208,10 @@ ul.caveats li { margin-bottom: 4px; }
         <span id="lbl-readers">Simultaneous readers</span>
         <div class="seg" id="readers" role="group" aria-labelledby="lbl-readers"></div>
       </div>
+      <div class="control" id="ctl-stat" hidden>
+        <span id="lbl-stat">Show</span>
+        <div class="seg" id="stats" role="group" aria-labelledby="lbl-stat"></div>
+      </div>
       <div class="control">
         <span id="lbl-scale">Scale</span>
         <div class="seg" id="scales" role="group" aria-labelledby="lbl-scale">
@@ -259,11 +263,21 @@ ul.caveats li { margin-bottom: 4px; }
       <li>The writer in “Read beside a writer” publishes continuously, and the readers in “Write” read continuously.
         Both are far harsher than a typical read-mostly workload.</li>
       <li>In “Read beside a writer” a subject with cheap writes gets more of them, and its readers pay for each one, so its reads
-        can look slower than those of a subject with a slow writer. The operations named after a number of writes per second
-        hold the writer of every subject to that rate. Every read beside a writer shows the writes per second there really were;
+        can look slower than those of a subject with a slow writer. The operation named after a number of writes per second
+        holds the writer of every subject to that rate. Every read beside a writer shows the writes per second there really were;
         <span class="short">†</span> marks a writer that was too slow for the rate, so its readers saw fewer writes than the others.</li>
-      <li>The CI machines have 4 CPUs. Reads without a writer go up to 4 readers; with a writer the sweep stops at 3 so the writer has a CPU of its own.</li>
+      <li>The CI machines have 4 CPUs. Reads without a writer go up to 4 readers; with a writer the sweep stops at 3 so the writer has a CPU of its own.
+        “Read beside a writer” and “Write” are measured once more with 8 readers, twice the CPUs: the threads then take turns on the
+        CPUs, and a reader or the writer can lose its CPU in the middle of a read or a write. A read is timed by the clock, so it
+        takes longer there for every subject; what differs is how much a thread that is not running holds up the others.
+        A subject can stall altogether there: if its writer (or its readers) cannot get 1,000 operations done in 2 seconds, it is
+        not measured and is listed as stalled.</li>
       <li>The range drawn around each dot on the log scale is criterion's 95% confidence interval for the median.</li>
+      <li>The median says nothing about the slow reads and writes. For “Read beside a writer” and “Write”, every read (or write)
+        was also timed on its own for half a second, and “Show” switches to the time that 99% or 99.9% of them stayed within, or to
+        the slowest one. Each of those times includes one reading of the clock, a few tens of nanoseconds, so for the fastest
+        subjects they say more about the clock than about the read; what they are for is the stalls of microseconds and more.
+        The slowest one of a short run on a shared machine is a matter of luck.</li>
       <li><span class="hold">◆</span> and <span class="hold">◇</span> mark subjects whose readers keep old values alive while idle.
         It is measured, not declared: the writer publishes a value, one reader reads it and then does nothing, and the writer
         publishes 100,000 more. Two things are counted afterwards: the allocations made by those writes that are still alive, and
@@ -314,6 +328,7 @@ const state = {
   run: 0,
   op: "read-writer",
   readers: null,
+  stat: "median",
   scale: "log",
   mode: "abs",
   hidden: new Set(),
@@ -443,17 +458,62 @@ const readersLabel = (r) => (r === 0 ? "no readers" : r === 1 ? "1 reader" : `${
 /* ---------- data access ---------- */
 const run = () => state.runs[state.run];
 const group = () => run().groups.find((g) => g.id === state.op);
-const series = (s, op) => s.results[op || state.op] || {};
+/* What to show of a result. "median" is criterion's time per operation. The others are in
+   `each`, which the results of some operations have: every read (or write) was timed on its own
+   there, and `p99`, `p999` and `max` are what 99% and 99.9% of them stayed within and the
+   slowest one. Each of those times includes one reading of the clock (`clock`). */
+const STATS = [
+  { id: "median", label: "Median" },
+  { id: "p99", label: "99%" },
+  { id: "p999", label: "99.9%" },
+  { id: "max", label: "Slowest" },
+];
+const hasEach = (op) => run().subjects.some((s) => Object.values(s.results[op] || {}).some((v) => v.each));
+/* the results of one subject for an operation; for the current one, as the chosen value */
+function series(s, op) {
+  const all = s.results[op || state.op] || {}, raw = {};
+  for (const r in all) if (!all[r].stalled) raw[r] = all[r];
+  if (op || state.stat === "median") return raw;
+  const out = {};
+  for (const r in raw) {
+    if (!raw[r].each) continue;
+    const v = raw[r].each[state.stat];
+    out[r] = { ...raw[r], median: v, lo: v, hi: v };
+  }
+  return out;
+}
+/* A result with `stalled` was not measured: with more threads than CPUs, the threads that would
+   have been timed got next to nowhere (`done` operations in `secs` seconds). */
+const stalledAt = (s, r) => { const v = (s.results[state.op] || {})[r]; return v && v.stalled ? v : null; };
+/* "time per read", or what else the values are */
+function what(g) {
+  return {
+    median: `time per ${g.op}`,
+    p99: `time that 99% of the ${g.op}s stay within`,
+    p999: `time that 99.9% of the ${g.op}s stay within`,
+    max: `time of the slowest ${g.op}`,
+  }[state.stat];
+}
+const per = (g) => ({ median: `per ${g.op}`, p99: `for 99% of the ${g.op}s`, p999: `for 99.9% of the ${g.op}s`, max: `for the slowest ${g.op}` }[state.stat]);
 const result = (s, r) => series(s)[r == null ? state.readers : r];
 function counts(op) {
   const set = new Set();
   for (const s of run().subjects) for (const r in series(s, op)) set.add(+r);
   return [...set].sort((a, b) => a - b);
 }
+/* more busy threads (the readers, and the writer if there is one) than the machine has CPUs */
+const oversubscribed = (g, r) => !!(g.readers_busy && run().meta.threads && r + (g.writer_threads || 0) > run().meta.threads);
 const machineLabel = (m) => m.label || m.arch || "run";
+/* what is different about the values when they are not criterion's */
+function eachText() {
+  if (state.stat === "median") return "";
+  const r = run().subjects.map((s) => result(s)).find((r) => r && r.each);
+  return ` Every ${group().op} was timed on its own for this` + (r ? `, which adds one reading of the clock (about ${fmt(r.each.clock)}) to each.` : ".");
+}
 function scenarioText() {
   const g = group();
-  return g.desc.replace(/\bR readers\b/, readersLabel(state.readers)).replace("no readers read as fast as they can", "nobody reads");
+  return g.desc.replace(/\bR readers\b/, readersLabel(state.readers)).replace("no readers read as fast as they can", "nobody reads")
+    + (oversubscribed(g, state.readers) ? ` That is more threads than the machine has CPUs (${run().meta.threads}), so they take turns.` : "");
 }
 
 /* ---------- header ---------- */
@@ -489,6 +549,8 @@ function renderControls() {
   $("#ctl-machine").hidden = state.runs.length < 2;
   seg($("#machines"), state.runs.map((r, i) => ({ id: i, label: machineLabel(r.meta) })), state.run, (i) => { state.run = i; normalize(); renderMeta(); update(); });
   seg($("#ops"), run().groups.filter((g) => counts(g.id).length).map((g) => ({ id: g.id, label: g.title })), state.op, (id) => { state.op = id; normalize(); update(); });
+  $("#ctl-stat").hidden = !hasEach(state.op);
+  seg($("#stats"), STATS, state.stat, (id) => { state.stat = id; normalize(); update(); });
   seg($("#readers"), counts().map((r) => ({ id: r, label: String(r) })), state.readers, (r) => { state.readers = r; update(); });
   for (const b of document.querySelectorAll("#scales button")) {
     b.setAttribute("aria-pressed", String(b.dataset.scale === state.scale));
@@ -519,6 +581,7 @@ function normalize() {
   if (!run().groups.some((g) => g.id === state.op && counts(g.id).length)) {
     state.op = (run().groups.find((g) => counts(g.id).length) || run().groups[0]).id;
   }
+  if (!STATS.some((x) => x.id === state.stat) || !hasEach(state.op)) state.stat = "median";
   const c = counts();
   if (!c.includes(state.readers)) {
     const below = c.filter((r) => r <= (state.readers == null ? 4 : state.readers));
@@ -549,14 +612,15 @@ function linearScale(max) {
 /* ---------- ranked chart ---------- */
 function renderChart() {
   const g = group();
-  $("#chart-title").textContent = `${g.title}, ${readersLabel(state.readers)}: time per ${g.op}`;
-  $("#chart-desc").textContent = scenarioText() + (state.scale === "log" ? " Log scale: each labelled gridline is 10× the one before." : "");
+  $("#chart-title").textContent = `${g.title}, ${readersLabel(state.readers)}: ${what(g)}`;
+  $("#chart-desc").textContent = scenarioText() + eachText() + (state.scale === "log" ? " Log scale: each labelled gridline is 10× the one before." : "");
 
   const all = run().subjects;
   const rows = all
     .filter((s) => result(s) && !state.hidden.has(s.kind))
     .sort((a, b) => result(a).median - result(b).median);
-  const missing = all.filter((s) => !result(s)).map((s) => s.name);
+  const stuck = all.filter((s) => stalledAt(s, state.readers));
+  const missing = all.filter((s) => !result(s) && !stuck.includes(s)).map((s) => s.name);
   const self = all.find((s) => s.name === SELF);
   const selfVal = self && result(self) ? result(self).median : null;
 
@@ -648,6 +712,7 @@ function renderChart() {
   const notes = [];
   if (selfVal != null && selfShown) notes.push("The vertical line marks local-rcu.");
   if (missing.length) notes.push(`Not measured here: ${missing.join(", ")}.`);
+  if (stuck.length) notes.push(`Stalled, so not measured: ${stuck.map((s) => { const v = stalledAt(s, state.readers); return `${s.name} (${v.done} ${g.op}s in ${v.secs} s)`; }).join(", ")}. Beside that many threads the ${g.op === "write" ? "writer" : "readers"} got next to nowhere.`);
   const short = rows.filter((s) => result(s).writer_short);
   if (short.length) notes.push(`${SHORT} The writer did not reach ${fmtRate(g.write_hz)} writes per second: ${short.map((s) => `${s.name} (${fmtRate(result(s).write_hz)})`).join(", ")}.`);
   $("#chart-note").textContent = notes.join(" ");
@@ -667,7 +732,7 @@ function togglePin(name) {
 function renderScaling() {
   const g = group(), cs = counts(), rel = state.mode === "rel";
   const first = cs[0];
-  $("#scaling-title").textContent = `${g.title}: how the time per ${g.op} changes with the number of readers`;
+  $("#scaling-title").textContent = `${g.title}: how the ${what(g)} changes with the number of readers`;
   $("#scaling-desc").textContent = rel
     ? `Each line is one subject, divided by its own time with ${readersLabel(first)}. A flat line at 1× scales perfectly.`
     : "Each line is one subject. A flat line scales perfectly; a rising line means readers get in each other's (or the writer's) way.";
@@ -700,7 +765,7 @@ function renderScaling() {
   const tickFmt = rel ? fmtRelTick : fmtTick;
 
   const root = svg("svg", { viewBox: `0 0 ${W} ${H}`, height: H, role: "img",
-    "aria-label": `${g.title}: time per ${g.op} against the number of readers, one line per subject. The table below has the same values.` });
+    "aria-label": `${g.title}: ${what(g)} against the number of readers, one line per subject. The table below has the same values.` });
 
   const majors = scale.ticks.filter((t) => t.major).length;
   scale.ticks.forEach((t, i) => {
@@ -800,10 +865,11 @@ function placeTip(ev, anchor) {
 }
 function showRowTip(s, ratio, ev, anchor) {
   const r = result(s), g = group();
-  const tip = tipHead(s, `${fmt(r.median)} per ${g.op}`);
+  const tip = tipHead(s, `${fmt(r.median)} ${per(g)}`);
   const dl = el("dl");
   const add = (k, v) => { dl.append(el("dt", {}, k), el("dd", {}, v)); };
-  add("95% CI", `${fmt(r.lo)} – ${fmt(r.hi)}`);
+  if (r.lo !== r.hi) add("95% CI", `${fmt(r.lo)} – ${fmt(r.hi)}`);
+  if (r.each) add(`Slow ${g.op}s`, `99% within ${fmt(r.each.p99)}, 99.9% within ${fmt(r.each.p999)}, slowest ${fmt(r.each.max)}`);
   if (r.write_hz != null) add("Writes", writesText(r));
   if (ratio && s.name !== SELF) add("vs local-rcu", ratio >= 1 ? `${fmtRatio(ratio)} slower` : `${fmtRatio(1 / ratio)} faster`);
   add("Kind", kindLabel(s.kind));
@@ -815,7 +881,7 @@ function showRowTip(s, ratio, ev, anchor) {
 }
 function showLineTip(l, r, ev) {
   const g = group(), p = l.pts.find((x) => x.r === r), base = l.pts[0];
-  const tip = tipHead(l.s, `${fmt(p.abs)} per ${g.op} with ${readersLabel(r)}`);
+  const tip = tipHead(l.s, `${fmt(p.abs)} ${per(g)} with ${readersLabel(r)}`);
   const t = el("table"), tb = el("tbody");
   for (const q of l.pts) {
     const tr = el("tr"), res = series(l.s)[q.r];
@@ -894,7 +960,8 @@ function renderTable() {
     row.append(firstCell);
     for (const r of cs) {
       const v = series(s)[r];
-      const td = el("td", {}, v ? fmt(v.median) : "—");
+      const td = el("td", {}, v ? fmt(v.median) : stalledAt(s, r) ? "stalled" : "—");
+      if (stalledAt(s, r)) td.title = `Not measured: ${stalledAt(s, r).done} ${group().op}s in ${stalledAt(s, r).secs} s.`;
       if (!v) td.classList.add("none");
       else if (v.write_hz != null) {
         td.title = `The writer made ${writesText(v)}.`;
@@ -937,6 +1004,7 @@ function update() {
   if (state.runs.length > 1) p.set("m", machineLabel(run().meta));
   p.set("op", state.op);
   p.set("r", state.readers);
+  if (state.stat !== "median") p.set("v", state.stat);
   if (state.scale !== "log") p.set("scale", state.scale);
   if (state.mode !== "abs") p.set("y", state.mode);
   if (state.pinned) p.set("pin", state.pinned);
@@ -949,6 +1017,7 @@ function restore() {
   if (m >= 0) state.run = m;
   if (p.get("op")) state.op = p.get("op");
   if (p.get("r") != null && p.get("r") !== "") state.readers = +p.get("r");
+  if (p.get("v")) state.stat = p.get("v");
   if (p.get("scale") === "linear") state.scale = "linear";
   if (p.get("y") === "rel") state.mode = "rel";
   const pin = p.get("pin");

@@ -22,9 +22,9 @@ impl Subject for Leak {
     }
 
     #[inline]
-    fn read(r: &mut Self::Reader) -> u64 {
+    fn read_with<T>(r: &mut Self::Reader, f: impl FnOnce(&Val) -> T) -> T {
         // SAFETY: values are never freed.
-        unsafe { (*r.load(Ordering::Acquire)).get() }
+        unsafe { f(&*r.load(Ordering::Acquire)) }
     }
 
     #[inline]

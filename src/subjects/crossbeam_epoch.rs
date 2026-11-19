@@ -28,10 +28,10 @@ impl Subject for CrossbeamEpoch {
     }
 
     #[inline]
-    fn read(r: &mut Self::Reader) -> u64 {
+    fn read_with<T>(r: &mut Self::Reader, f: impl FnOnce(&Val) -> T) -> T {
         let guard = epoch::pin();
         // SAFETY: never null, and the guard keeps the value alive.
-        unsafe { r.0.load(Ordering::Acquire, &guard).deref().get() }
+        f(unsafe { r.0.load(Ordering::Acquire, &guard).deref() })
     }
 
     #[inline]

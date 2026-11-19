@@ -19,9 +19,9 @@ impl Subject for Sdd {
     }
 
     #[inline]
-    fn read(r: &mut Self::Reader) -> u64 {
+    fn read_with<T>(r: &mut Self::Reader, f: impl FnOnce(&Val) -> T) -> T {
         let guard = Guard::new();
-        r.load(Ordering::Acquire, &guard).as_ref().unwrap().get()
+        f(r.load(Ordering::Acquire, &guard).as_ref().unwrap())
     }
 
     #[inline]

@@ -16,8 +16,8 @@ impl Subject for SwmrCell {
     }
 
     #[inline]
-    fn read(r: &mut Self::Reader) -> u64 {
-        r.pin().get()
+    fn read_with<T>(r: &mut Self::Reader, f: impl FnOnce(&Val) -> T) -> T {
+        f(&r.pin())
     }
 
     #[inline]
@@ -46,8 +46,8 @@ impl Subject for SwmrCellReadPreferred {
     }
 
     #[inline]
-    fn read(r: &mut Self::Reader) -> u64 {
-        r.pin().get()
+    fn read_with<T>(r: &mut Self::Reader, f: impl FnOnce(&Val) -> T) -> T {
+        f(&r.pin())
     }
 
     #[inline]

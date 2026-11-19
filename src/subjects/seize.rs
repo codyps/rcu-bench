@@ -36,11 +36,11 @@ impl Subject for Seize {
     }
 
     #[inline]
-    fn read(r: &mut Self::Reader) -> u64 {
+    fn read_with<T>(r: &mut Self::Reader, f: impl FnOnce(&Val) -> T) -> T {
         let guard = r.collector.enter();
         let p = guard.protect(&r.ptr, Ordering::Acquire);
         // SAFETY: never null, and the guard keeps the value alive.
-        unsafe { (*p).get() }
+        f(unsafe { &*p })
     }
 
     #[inline]

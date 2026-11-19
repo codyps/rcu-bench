@@ -18,8 +18,8 @@ impl Subject for RwLockVal {
     }
 
     #[inline]
-    fn read(r: &mut Self::Reader) -> u64 {
-        r.read().unwrap().get()
+    fn read_with<T>(r: &mut Self::Reader, f: impl FnOnce(&Val) -> T) -> T {
+        f(&r.read().unwrap())
     }
 
     #[inline]
@@ -43,9 +43,9 @@ impl Subject for RwLockArc {
     }
 
     #[inline]
-    fn read(r: &mut Self::Reader) -> u64 {
+    fn read_with<T>(r: &mut Self::Reader, f: impl FnOnce(&Val) -> T) -> T {
         let v = r.read().unwrap().clone();
-        v.get()
+        f(&v)
     }
 
     #[inline]
@@ -70,9 +70,9 @@ impl Subject for MutexArc {
     }
 
     #[inline]
-    fn read(r: &mut Self::Reader) -> u64 {
+    fn read_with<T>(r: &mut Self::Reader, f: impl FnOnce(&Val) -> T) -> T {
         let v = r.lock().unwrap().clone();
-        v.get()
+        f(&v)
     }
 
     #[inline]

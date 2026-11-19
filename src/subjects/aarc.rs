@@ -17,8 +17,8 @@ impl Subject for Aarc {
     }
 
     #[inline]
-    fn read(r: &mut Self::Reader) -> u64 {
-        r.load().unwrap().get()
+    fn read_with<T>(r: &mut Self::Reader, f: impl FnOnce(&Val) -> T) -> T {
+        f(&r.load().unwrap())
     }
 
     #[inline]

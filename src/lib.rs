@@ -6,6 +6,20 @@
 
 pub mod subjects;
 
+/// How long a reader in the `write-held` group stays in each read: `RCU_BENCH_HOLD_US`
+/// microseconds, 10 by default. The benchmark and the report both take it from here.
+pub fn hold_time() -> std::time::Duration {
+    const VAR: &str = "RCU_BENCH_HOLD_US";
+    let us: f64 = match std::env::var(VAR) {
+        Ok(v) => v
+            .parse()
+            .unwrap_or_else(|_| panic!("{VAR} must be a number")),
+        Err(_) => 10.0,
+    };
+    assert!(us > 0.0, "{VAR} must be above 0");
+    std::time::Duration::from_secs_f64(us / 1e6)
+}
+
 /// The value stored in every cell.
 ///
 /// Small and `Copy` so that crates which only support `Copy` types (`seqlock`) can take part.
@@ -85,8 +99,15 @@ pub trait Subject: 'static {
     /// Create a cell holding `init`, and `readers` reader handles for it.
     fn new(init: Val, readers: usize) -> (Self::Writer, Vec<Self::Reader>);
 
+    /// Read the current value and hand it to `f`. Access to the value (guard, lock, borrow,
+    /// `Arc`, ...) is kept for as long as `f` runs, and given up before this returns.
+    fn read_with<T>(r: &mut Self::Reader, f: impl FnOnce(&Val) -> T) -> T;
+
     /// Read the current value and look at it.
-    fn read(r: &mut Self::Reader) -> u64;
+    #[inline]
+    fn read(r: &mut Self::Reader) -> u64 {
+        Self::read_with(r, Val::get)
+    }
 
     /// Publish a new value.
     fn write(w: &mut Self::Writer, v: Val);
@@ -144,6 +165,5 @@ macro_rules! for_each_subject {
         $m!($crate::subjects::sdd::Sdd);
         $m!($crate::subjects::haphazard::Haphazard);
         $m!($crate::subjects::kovan::Kovan);
-        $m!($crate::subjects::kovan::KovanRaw);
     };
 }

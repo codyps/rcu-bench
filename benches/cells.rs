@@ -5,10 +5,11 @@
 //! - `read`:        R readers, no writer
 //! - `read-writer`: R readers, while a writer publishes as fast as it can
 //! - `read-paced`:  R readers, while a writer publishes at a fixed rate, the same for every
-//!   subject (`RCU_BENCH_WRITE_HZ` writes per second, 50000 by default)
-//! - `read-paced-fast`: the same at a higher rate (`RCU_BENCH_FAST_WRITE_HZ`, 1000000 by
-//!   default)
+//!   subject (`RCU_BENCH_WRITE_HZ` writes per second, 1000000 by default)
 //! - `write`:       the writer, while R readers read as fast as they can (R starts at 0)
+//! - `write-held`:  the writer, while R readers read and keep their access to the value
+//!   (guard, lock, borrow, `Arc`, ...) for a fixed time before they give it up and read again
+//!   (`RCU_BENCH_HOLD_US` microseconds, 10 by default)
 //! - `write-idle`:  the writer, while R readers do nothing: each has read once, on a thread
 //!   of its own that then sleeps, and keeps its handle
 //!
@@ -17,23 +18,38 @@
 //! `RCU_BENCH_MAX_READERS` caps R. By default it is the number of CPUs (at most 8). The
 //! groups with a writer stop one short of the cap, so that the writer has a CPU of its own.
 //!
+//! `read-writer` and `write` are measured once more with more readers than there are CPUs, so
+//! that readers (and the writer) are taken off their CPU in the middle of what they do:
+//! `RCU_BENCH_OVERSUBSCRIBED` readers, twice the number of CPUs by default, 0 for none.
+//!
+//! With more threads than CPUs a thread can get nowhere at all: a writer that has to find a
+//! moment with no reader in its way may never find one. Before anything oversubscribed is
+//! measured, the threads that would be timed are given 2 seconds for 1000 operations. If
+//! they do not get there, nothing is measured and `stalled.json` says how far they got.
+//!
 //! Idle readers need no CPU, so `write-idle` has a cap of its own: `RCU_BENCH_MAX_IDLE`, 64
 //! by default.
 //!
 //! In `read-writer` a subject with cheap writes gets more of them, and its readers pay for
 //! every one (a cache miss on the new value, at least), so its reads look slower than those of
-//! a subject whose writer is slow. The paced groups give every subject the same number of
+//! a subject whose writer is slow. The paced group gives every subject the same number of
 //! writes per second. The writer spins between writes instead of sleeping, to stay on its CPU
 //! and on time. A writer that cannot keep up writes as fast as it can.
 //!
 //! The read groups with a writer record how many writes per second there were, next to
 //! criterion's results (`writes.json`), for `report` to show.
 //!
+//! Criterion times many operations at once and reports the time per operation, which says
+//! nothing about the slow ones. So `read-writer` and `write` are run once more after
+//! criterion is done, with every read (or write) timed on its own, for
+//! `RCU_BENCH_TAIL_MS` milliseconds (500 by default, 0 for not at all). The 99th and 99.9th
+//! percentile and the slowest one go to `tails.json`, next to criterion's results.
+//!
 //! Read groups report the time per read as seen by one reader (averaged over the readers).
 //! The write group reports the time per write.
 
 use criterion::measurement::WallTime;
-use criterion::{criterion_group, criterion_main, BenchmarkGroup, BenchmarkId, Criterion};
+use criterion::{criterion_group, BenchmarkGroup, BenchmarkId, Criterion};
 use rcu_bench::{for_each_subject, Subject, Val};
 use std::hint::black_box;
 use std::path::PathBuf;
@@ -54,6 +70,26 @@ fn reader_counts(limit: usize) -> Vec<usize> {
         .into_iter()
         .filter(|&r| r <= limit)
         .collect()
+}
+
+/// A number of readers that is more than the CPUs can run at once, to measure beside the
+/// others: `RCU_BENCH_OVERSUBSCRIBED`, twice the number of CPUs by default. `None` if it is
+/// set to 0.
+fn oversubscribed() -> Option<usize> {
+    let n = match std::env::var("RCU_BENCH_OVERSUBSCRIBED") {
+        Ok(v) => v
+            .parse()
+            .expect("RCU_BENCH_OVERSUBSCRIBED must be a number"),
+        Err(_) => 2 * std::thread::available_parallelism().map_or(4, |n| n.get()),
+    };
+    (n > 0).then_some(n)
+}
+
+/// `counts` and the oversubscribed number of readers.
+fn with_oversubscribed(counts: &[usize]) -> Vec<usize> {
+    let mut all = counts.to_vec();
+    all.extend(oversubscribed().filter(|n| !counts.contains(n)));
+    all
 }
 
 /// The numbers of idle readers to measure.
@@ -115,21 +151,35 @@ impl Writes {
                  second instead of {target:.0}"
             );
         }
-        let dir = match std::env::var_os("CRITERION_HOME") {
-            Some(home) => PathBuf::from(home),
-            None => std::env::var_os("CARGO_TARGET_DIR")
-                .map_or("target".into(), PathBuf::from)
-                .join("criterion"),
-        };
-        let path = dir
-            .join(group)
-            .join(subject)
-            .join(readers.to_string())
-            .join("writes.json");
         let doc = serde_json::json!({ "hz": hz, "target_hz": target });
-        if let Err(e) = std::fs::write(&path, doc.to_string()) {
-            eprintln!("cannot write {}: {e}", path.display());
-        }
+        write_beside_criterion(group, subject, readers, "writes.json", &doc);
+    }
+}
+
+/// The directory criterion keeps the results of one benchmark in.
+fn criterion_dir(group: &str, subject: &str, readers: usize) -> PathBuf {
+    let dir = match std::env::var_os("CRITERION_HOME") {
+        Some(home) => PathBuf::from(home),
+        None => std::env::var_os("CARGO_TARGET_DIR")
+            .map_or("target".into(), PathBuf::from)
+            .join("criterion"),
+    };
+    dir.join(group).join(subject).join(readers.to_string())
+}
+
+/// Writes `doc` to `file` in the directory criterion keeps the results of one benchmark in.
+fn write_beside_criterion(
+    group: &str,
+    subject: &str,
+    readers: usize,
+    file: &str,
+    doc: &serde_json::Value,
+) {
+    let dir = criterion_dir(group, subject, readers);
+    let written = std::fs::create_dir_all(&dir)
+        .and_then(|()| std::fs::write(dir.join(file), doc.to_string()));
+    if let Err(e) = written {
+        eprintln!("cannot write {}: {e}", dir.join(file).display());
     }
 }
 
@@ -152,6 +202,120 @@ fn paced_writes<S: Subject>(w: &mut S::Writer, interval: Duration, stop: &Atomic
         writes += 1;
         S::write(w, Val::new(writes));
     }
+}
+
+/// Which threads a benchmark times.
+#[derive(Clone, Copy)]
+enum Timed {
+    Readers,
+    Writer,
+}
+
+/// The operations every timed thread has to get done in [`PROGRESS_TIME`] for a benchmark
+/// with more threads than CPUs to be worth starting.
+const PROGRESS_OPS: u64 = 1000;
+const PROGRESS_TIME: Duration = Duration::from_secs(2);
+
+/// Whether `readers` readers and a writer, all going as fast as they can, are more threads
+/// than there are CPUs.
+fn is_oversubscribed(readers: usize) -> bool {
+    readers + 1 > std::thread::available_parallelism().map_or(usize::MAX, |n| n.get())
+}
+
+/// Lets `readers` readers and a writer run as fast as they can, and waits for each of the
+/// `timed` threads to get [`PROGRESS_OPS`] operations done. Returns how far the slowest of them
+/// got if that takes longer than [`PROGRESS_TIME`].
+///
+/// All threads are told to stop before any of them is waited for: one that the others kept
+/// from getting anywhere can only finish what it is in the middle of once they have stopped.
+fn progress<S: Subject>(readers: usize, timed: Timed) -> Result<(), u64> {
+    use std::sync::atomic::AtomicU64;
+
+    let (mut w, rs) = S::new(Val::new(0), readers);
+    let stop_readers = Arc::new(AtomicBool::new(false));
+    let stop_writer = Arc::new(AtomicBool::new(false));
+    let mut done = Vec::new();
+    let mut counter = |counted: bool| {
+        let n = Arc::new(AtomicU64::new(0));
+        if counted {
+            done.push(n.clone());
+        }
+        n
+    };
+
+    let reader_threads: Vec<_> = rs
+        .into_iter()
+        .map(|mut r| {
+            let stop = stop_readers.clone();
+            let n = counter(matches!(timed, Timed::Readers));
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    black_box(S::read(&mut r));
+                    n.fetch_add(1, Ordering::Relaxed);
+                }
+            })
+        })
+        .collect();
+    let writer_thread = {
+        let stop = stop_writer.clone();
+        let n = counter(matches!(timed, Timed::Writer));
+        std::thread::spawn(move || {
+            let mut i = 0;
+            while !stop.load(Ordering::Relaxed) {
+                i += 1;
+                S::write(&mut w, Val::new(i));
+                n.fetch_add(1, Ordering::Relaxed);
+            }
+        })
+    };
+
+    let slowest = || {
+        done.iter()
+            .map(|n| n.load(Ordering::Relaxed))
+            .min()
+            .unwrap_or(PROGRESS_OPS)
+    };
+    let start = Instant::now();
+    while slowest() < PROGRESS_OPS && start.elapsed() < PROGRESS_TIME {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let got = slowest();
+
+    stop_readers.store(true, Ordering::Relaxed);
+    stop_writer.store(true, Ordering::Relaxed);
+    for t in reader_threads {
+        t.join().unwrap();
+    }
+    writer_thread.join().unwrap();
+    if got < PROGRESS_OPS {
+        Err(got)
+    } else {
+        Ok(())
+    }
+}
+
+/// Whether the benchmark `group/S/readers` can be measured. With more threads than CPUs that
+/// is only so if the timed threads get somewhere: see [`progress`]. If they do not, this says
+/// so, and leaves `stalled.json` where the results would be.
+fn measurable<S: Subject>(group: &str, readers: usize, timed: Timed) -> bool {
+    let stalled = criterion_dir(group, S::NAME, readers).join("stalled.json");
+    // whatever an earlier run found
+    let _ = std::fs::remove_file(&stalled);
+    if !is_oversubscribed(readers) {
+        return true;
+    }
+    let Err(got) = progress::<S>(readers, timed) else {
+        return true;
+    };
+    let secs = PROGRESS_TIME.as_secs_f64();
+    eprintln!(
+        "{group}/{}/{readers}: stalled, not measured: {got} of {PROGRESS_OPS} operations in \
+         {secs} s",
+        S::NAME
+    );
+    let doc = serde_json::json!({ "done": got, "wanted": PROGRESS_OPS, "secs": secs });
+    write_beside_criterion(group, S::NAME, readers, "stalled.json", &doc);
+    false
 }
 
 /// `readers` threads each do `iters` reads. Returns the mean time one reader took, and adds
@@ -253,6 +417,49 @@ fn run_write<S: Subject>(iters: u64, readers: usize) -> Duration {
     elapsed
 }
 
+/// The writer does `iters` writes while `readers` threads keep reading, each staying in its
+/// read for `hold`: it spins with its access to the value kept, gives the access up, and reads
+/// again at once. Returns the time the writes took.
+fn run_write_held<S: Subject>(iters: u64, readers: usize, hold: Duration) -> Duration {
+    let (mut w, rs) = S::new(Val::new(0), readers);
+    let start = Arc::new(Barrier::new(readers + 1));
+    let stop = Arc::new(AtomicBool::new(false));
+
+    let reader_threads: Vec<_> = rs
+        .into_iter()
+        .map(|mut r| {
+            let start = start.clone();
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                start.wait();
+                while !stop.load(Ordering::Relaxed) {
+                    black_box(S::read_with(&mut r, |v| {
+                        let v = v.get();
+                        let until = Instant::now() + hold;
+                        while Instant::now() < until {
+                            std::hint::spin_loop();
+                        }
+                        v
+                    }));
+                }
+            })
+        })
+        .collect();
+
+    start.wait();
+    let t = Instant::now();
+    for i in 0..iters {
+        S::write(&mut w, Val::new(i));
+    }
+    let elapsed = t.elapsed();
+
+    stop.store(true, Ordering::Relaxed);
+    for t in reader_threads {
+        t.join().unwrap();
+    }
+    elapsed
+}
+
 /// The writer does `iters` writes while `idle` readers do nothing. Each of them has read once,
 /// on a thread of its own, and that thread then sleeps without giving up its handle (or
 /// whatever the subject keeps per thread). Returns the time the writes took.
@@ -302,6 +509,12 @@ fn read_one<S: Subject>(
         if readers > S::MAX_READERS {
             continue;
         }
+        if !matches!(load, WriterLoad::None)
+            && wanted(group, S::NAME, readers)
+            && !measurable::<S>(group, readers, Timed::Readers)
+        {
+            continue;
+        }
         let mut writes = Writes::default();
         g.bench_function(BenchmarkId::new(S::NAME, readers), |b| {
             b.iter_custom(|iters| run_read::<S>(iters, readers, load, &mut writes))
@@ -310,17 +523,39 @@ fn read_one<S: Subject>(
     }
 }
 
-fn write_one<S: Subject>(g: &mut BenchmarkGroup<'_, WallTime>, counts: &[usize], idle: bool) {
+/// What the readers do while the writer is measured.
+#[derive(Clone, Copy)]
+enum ReaderLoad {
+    /// Read as fast as possible.
+    Flat,
+    /// Read once and sleep.
+    Idle,
+    /// Read, and stay in every read for this long.
+    Held(Duration),
+}
+
+fn write_one<S: Subject>(
+    g: &mut BenchmarkGroup<'_, WallTime>,
+    group: &str,
+    counts: &[usize],
+    load: ReaderLoad,
+) {
     for &readers in counts {
         if readers > S::MAX_READERS {
             continue;
         }
+        if matches!(load, ReaderLoad::Flat)
+            && wanted(group, S::NAME, readers)
+            && !measurable::<S>(group, readers, Timed::Writer)
+        {
+            continue;
+        }
         g.bench_function(BenchmarkId::new(S::NAME, readers), |b| {
-            if idle {
-                b.iter_custom(|iters| run_write_idle::<S>(iters, readers))
-            } else {
-                b.iter_custom(|iters| run_write::<S>(iters, readers))
-            }
+            b.iter_custom(|iters| match load {
+                ReaderLoad::Flat => run_write::<S>(iters, readers),
+                ReaderLoad::Idle => run_write_idle::<S>(iters, readers),
+                ReaderLoad::Held(hold) => run_write_held::<S>(iters, readers, hold),
+            })
         });
     }
 }
@@ -336,11 +571,11 @@ fn read_group(c: &mut Criterion, name: &str, counts: &[usize], load: WriterLoad)
     g.finish();
 }
 
-fn write_group(c: &mut Criterion, name: &str, counts: &[usize], idle: bool) {
+fn write_group(c: &mut Criterion, name: &str, counts: &[usize], load: ReaderLoad) {
     let mut g = c.benchmark_group(name);
     macro_rules! one {
         ($t:ty) => {
-            write_one::<$t>(&mut g, counts, idle);
+            write_one::<$t>(&mut g, name, counts, load);
         };
     }
     for_each_subject!(one);
@@ -355,13 +590,19 @@ fn benches(c: &mut Criterion) {
     for_write.extend(&beside_writer);
 
     read_group(c, "read", &alone, WriterLoad::None);
-    read_group(c, "read-writer", &beside_writer, WriterLoad::Flat);
-    let paced = WriterLoad::Paced(write_interval("RCU_BENCH_WRITE_HZ", 50_000.0));
+    let flat = with_oversubscribed(&beside_writer);
+    read_group(c, "read-writer", &flat, WriterLoad::Flat);
+    let paced = WriterLoad::Paced(write_interval("RCU_BENCH_WRITE_HZ", 1_000_000.0));
     read_group(c, "read-paced", &beside_writer, paced);
-    let fast = WriterLoad::Paced(write_interval("RCU_BENCH_FAST_WRITE_HZ", 1_000_000.0));
-    read_group(c, "read-paced-fast", &beside_writer, fast);
-    write_group(c, "write", &for_write, false);
-    write_group(c, "write-idle", &idle_counts(), true);
+    write_group(
+        c,
+        "write",
+        &with_oversubscribed(&for_write),
+        ReaderLoad::Flat,
+    );
+    write_group(c, "write-idle", &idle_counts(), ReaderLoad::Idle);
+    let held = ReaderLoad::Held(rcu_bench::hold_time());
+    write_group(c, "write-held", &beside_writer, held);
 }
 
 criterion_group! {
@@ -372,4 +613,291 @@ criterion_group! {
         .measurement_time(Duration::from_millis(1500));
     targets = benches
 }
-criterion_main!(cells);
+
+/// How many single operations took how long. The times are counted in buckets, 16 for every
+/// doubling, so a percentile is at most 1/16 above the real one.
+struct Histogram {
+    buckets: Vec<u64>,
+    count: u64,
+    max: u64,
+}
+
+impl Histogram {
+    fn new() -> Self {
+        Histogram {
+            buckets: vec![0; 61 * 16],
+            count: 0,
+            max: 0,
+        }
+    }
+
+    /// The bucket of a time in nanoseconds: one for each time below 16, then 16 for each
+    /// power of two.
+    fn bucket(ns: u64) -> usize {
+        if ns < 16 {
+            return ns as usize;
+        }
+        let exp = 63 - ns.leading_zeros();
+        let sub = (ns >> (exp - 4)) & 15;
+        ((exp - 3) * 16) as usize + sub as usize
+    }
+
+    /// The longest time that goes into `bucket`.
+    fn upper(bucket: usize) -> u64 {
+        if bucket < 16 {
+            return bucket as u64;
+        }
+        let shift = (bucket / 16 + 3 - 4) as u32;
+        let low = (16 + (bucket % 16) as u64) << shift;
+        low + ((1 << shift) - 1)
+    }
+
+    #[inline]
+    fn record(&mut self, ns: u64) {
+        self.buckets[Self::bucket(ns)] += 1;
+        self.count += 1;
+        self.max = self.max.max(ns);
+    }
+
+    fn merge(&mut self, other: &Histogram) {
+        for (a, b) in self.buckets.iter_mut().zip(&other.buckets) {
+            *a += b;
+        }
+        self.count += other.count;
+        self.max = self.max.max(other.max);
+    }
+
+    /// The time that the share `q` of the operations stayed at or below.
+    fn quantile(&self, q: f64) -> u64 {
+        let wanted = ((q * self.count as f64).ceil() as u64).clamp(1, self.count.max(1));
+        let mut seen = 0;
+        for (i, n) in self.buckets.iter().enumerate() {
+            seen += n;
+            if seen >= wanted {
+                return Self::upper(i).min(self.max);
+            }
+        }
+        self.max
+    }
+}
+
+/// Does `op` again and again for `time`, and times every single one. The clock is read once
+/// per operation: the end of one is the start of the next, so each time includes one reading
+/// of the clock. The first tenth of the time is a warm-up and is not counted.
+fn time_each(time: Duration, mut op: impl FnMut()) -> Histogram {
+    let mut h = Histogram::new();
+    let mut last = Instant::now();
+    let counted_from = last + time / 10;
+    let end = last + time;
+    loop {
+        op();
+        let now = Instant::now();
+        if last >= counted_from {
+            h.record((now - last).as_nanos() as u64);
+        }
+        last = now;
+        if now >= end {
+            return h;
+        }
+    }
+}
+
+/// `readers` threads read for `time`, each read timed on its own, while a writer publishes as
+/// fast as it can. Returns the times of all the reads.
+fn tail_read<S: Subject>(readers: usize, time: Duration) -> Histogram {
+    let (mut w, rs) = S::new(Val::new(0), readers);
+    let start = Arc::new(Barrier::new(readers + 1));
+    let stop = Arc::new(AtomicBool::new(false));
+
+    let reader_threads: Vec<_> = rs
+        .into_iter()
+        .map(|mut r| {
+            let start = start.clone();
+            std::thread::spawn(move || {
+                start.wait();
+                time_each(time, || {
+                    black_box(S::read(&mut r));
+                })
+            })
+        })
+        .collect();
+    let writer_thread = {
+        let start = start.clone();
+        let stop = stop.clone();
+        std::thread::spawn(move || {
+            start.wait();
+            let mut i = 0;
+            while !stop.load(Ordering::Relaxed) {
+                i += 1;
+                S::write(&mut w, Val::new(i));
+            }
+        })
+    };
+
+    let mut all = Histogram::new();
+    for t in reader_threads {
+        all.merge(&t.join().unwrap());
+    }
+    stop.store(true, Ordering::Relaxed);
+    writer_thread.join().unwrap();
+    all
+}
+
+/// The writer writes for `time`, each write timed on its own, while `readers` threads read as
+/// fast as they can. Returns the times of the writes.
+fn tail_write<S: Subject>(readers: usize, time: Duration) -> Histogram {
+    let (mut w, rs) = S::new(Val::new(0), readers);
+    let start = Arc::new(Barrier::new(readers + 1));
+    let stop = Arc::new(AtomicBool::new(false));
+
+    let reader_threads: Vec<_> = rs
+        .into_iter()
+        .map(|mut r| {
+            let start = start.clone();
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                start.wait();
+                while !stop.load(Ordering::Relaxed) {
+                    black_box(S::read(&mut r));
+                }
+            })
+        })
+        .collect();
+
+    start.wait();
+    let mut i = 0;
+    let h = time_each(time, || {
+        i += 1;
+        S::write(&mut w, Val::new(i));
+    });
+
+    stop.store(true, Ordering::Relaxed);
+    for t in reader_threads {
+        t.join().unwrap();
+    }
+    h
+}
+
+/// Whether the filter on the command line lets the benchmark `group/subject/readers` run.
+fn wanted(group: &str, subject: &str, readers: usize) -> bool {
+    static FILTER: std::sync::OnceLock<Option<regex::Regex>> = std::sync::OnceLock::new();
+    let id = format!("{group}/{subject}/{readers}");
+    FILTER
+        .get_or_init(filter)
+        .as_ref()
+        .is_none_or(|f| f.is_match(&id))
+}
+
+/// The benchmark filter from the command line, as criterion understands it: the first argument
+/// that is neither an option nor the value of one.
+fn filter() -> Option<regex::Regex> {
+    const WITH_VALUE: &[&str] = &[
+        "--baseline",
+        "--baseline-lenient",
+        "--color",
+        "--confidence-level",
+        "--format",
+        "--load-baseline",
+        "--logfile",
+        "--measurement-time",
+        "--noise-threshold",
+        "--nresamples",
+        "--output-format",
+        "--plotting-backend",
+        "--profile-time",
+        "--sample-size",
+        "--save-baseline",
+        "--significance-level",
+        "--warm-up-time",
+    ];
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        if WITH_VALUE.contains(&arg.as_str()) {
+            args.next();
+        } else if !arg.starts_with('-') {
+            return Some(regex::Regex::new(&arg).expect("the filter must be a regular expression"));
+        }
+    }
+    None
+}
+
+fn tail_one<S: Subject>(
+    group: &str,
+    counts: &[usize],
+    time: Duration,
+    clock: u64,
+    run: fn(usize, Duration) -> Histogram,
+) {
+    for &readers in counts {
+        let id = format!("{group}/{}/{readers}", S::NAME);
+        if readers > S::MAX_READERS || !wanted(group, S::NAME, readers) {
+            continue;
+        }
+        // what criterion's run of this benchmark found
+        if criterion_dir(group, S::NAME, readers)
+            .join("stalled.json")
+            .exists()
+        {
+            continue;
+        }
+        let h = run(readers, time);
+        if h.count == 0 {
+            continue;
+        }
+        let (p50, p99, p999) = (h.quantile(0.5), h.quantile(0.99), h.quantile(0.999));
+        println!(
+            "{id}: one at a time: half within {p50} ns, 99% within {p99} ns, 99.9% within \
+             {p999} ns, slowest {} ns ({} timed)",
+            h.max, h.count
+        );
+        let doc = serde_json::json!({
+            "count": h.count, "p50": p50, "p99": p99, "p999": p999, "max": h.max,
+            "clock": clock,
+        });
+        write_beside_criterion(group, S::NAME, readers, "tails.json", &doc);
+    }
+}
+
+/// `read-writer` and `write` once more, with every operation timed on its own.
+fn tails() {
+    let ms: u64 = match std::env::var("RCU_BENCH_TAIL_MS") {
+        Ok(v) => v.parse().expect("RCU_BENCH_TAIL_MS must be a number"),
+        Err(_) => 500,
+    };
+    // without `--bench` criterion only tries every benchmark once, and so with these options
+    let args: Vec<String> = std::env::args().collect();
+    let has = |opt: &str| args.iter().any(|a| a == opt);
+    if ms == 0 || !has("--bench") || has("--list") || has("--test") || has("--profile-time") {
+        return;
+    }
+    let time = Duration::from_millis(ms);
+
+    // what reading the clock costs: every time measured includes it once
+    let clock = time_each(Duration::from_millis(50), || {}).quantile(0.5);
+
+    let max = max_readers().max(2);
+    let beside_writer = reader_counts(max - 1);
+    let mut for_write = vec![0];
+    for_write.extend(&beside_writer);
+    let reads = with_oversubscribed(&beside_writer);
+    let writes = with_oversubscribed(&for_write);
+
+    macro_rules! read {
+        ($t:ty) => {
+            tail_one::<$t>("read-writer", &reads, time, clock, tail_read::<$t>);
+        };
+    }
+    for_each_subject!(read);
+    macro_rules! write {
+        ($t:ty) => {
+            tail_one::<$t>("write", &writes, time, clock, tail_write::<$t>);
+        };
+    }
+    for_each_subject!(write);
+}
+
+fn main() {
+    cells();
+    Criterion::default().configure_from_args().final_summary();
+    tails();
+}

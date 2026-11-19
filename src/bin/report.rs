@@ -495,6 +495,16 @@ struct Group {
     /// Whether the writer is held to a fixed rate. The title and description then name the
     /// rate that was measured at, when the results have it.
     paced: bool,
+    /// The threads that are busy next to the R readers: the writer, if there is one.
+    writer_threads: u32,
+    /// Whether the readers are busy, and so need a CPU each.
+    readers_busy: bool,
+}
+
+/// The CPUs of this machine.
+fn cpus() -> Option<u32> {
+    let n = std::thread::available_parallelism().ok()?;
+    u32::try_from(n.get()).ok()
 }
 
 const GROUPS: &[Group] = &[
@@ -504,6 +514,8 @@ const GROUPS: &[Group] = &[
         desc: "R readers at once, no writer.",
         op: "read",
         paced: false,
+        writer_threads: 0,
+        readers_busy: true,
     },
     Group {
         id: "read-writer",
@@ -511,6 +523,8 @@ const GROUPS: &[Group] = &[
         desc: "R readers, while a writer publishes as fast as it can.",
         op: "read",
         paced: false,
+        writer_threads: 1,
+        readers_busy: true,
     },
     Group {
         id: "read-paced",
@@ -518,14 +532,8 @@ const GROUPS: &[Group] = &[
         desc: "R readers, while a writer publishes at a fixed rate, the same for every subject.",
         op: "read",
         paced: true,
-    },
-    Group {
-        id: "read-paced-fast",
-        title: "Read beside a fast paced writer",
-        desc: "R readers, while a writer publishes at a fixed, high rate, the same for every \
-               subject.",
-        op: "read",
-        paced: true,
+        writer_threads: 1,
+        readers_busy: true,
     },
     Group {
         id: "write",
@@ -533,6 +541,8 @@ const GROUPS: &[Group] = &[
         desc: "The writer, while R readers read as fast as they can.",
         op: "write",
         paced: false,
+        writer_threads: 1,
+        readers_busy: true,
     },
     Group {
         id: "write-idle",
@@ -541,6 +551,18 @@ const GROUPS: &[Group] = &[
                that then sleeps, and keeps its handle.",
         op: "write",
         paced: false,
+        writer_threads: 1,
+        readers_busy: false,
+    },
+    Group {
+        id: "write-held",
+        title: "Write beside readers that hold on",
+        desc: "The writer, while R readers read and keep their access to the value (guard, \
+               lock, borrow, Arc) for a fixed time before they give it up and read again.",
+        op: "write",
+        paced: false,
+        writer_threads: 1,
+        readers_busy: true,
     },
 ];
 
@@ -560,8 +582,25 @@ impl Group {
         })
     }
 
-    /// Title and description, naming the rate of a paced writer if it is known.
+    /// Whether the group with `readers` readers has more busy threads than there are CPUs.
+    fn oversubscribed(&self, readers: u32) -> bool {
+        self.readers_busy && cpus().is_some_and(|n| readers + self.writer_threads > n)
+    }
+
+    /// Title and description, naming the rate of a paced writer if it is known, and the time
+    /// the readers of `write-held` stay in a read.
     fn text(&self, write_hz: Option<f64>) -> (String, String) {
+        if self.id == "write-held" {
+            let hold = format!("{} µs", rcu_bench::hold_time().as_secs_f64() * 1e6);
+            return (
+                format!("Write beside readers that hold on for {hold}"),
+                format!(
+                    "The writer, while R readers read and keep their access to the value \
+                     (guard, lock, borrow, Arc) for {hold} before they give it up and read \
+                     again."
+                ),
+            );
+        }
         match write_hz {
             Some(hz) => (
                 format!("Read beside {} writes/s", fmt_rate(hz)),
@@ -585,6 +624,37 @@ struct Estimate {
     write_hz: Option<f64>,
     /// The writes per second the writer was paced at, if it was.
     write_target_hz: Option<f64>,
+    /// The slow operations, where the benchmark timed every one on its own.
+    tails: Option<Tails>,
+}
+
+/// Times of single operations in nanoseconds.
+struct Tails {
+    /// Half of them took at most this long. Not criterion's median: each of these times
+    /// includes a reading of the clock.
+    p50: f64,
+    /// 99% of them took at most this long.
+    p99: f64,
+    /// 99.9% of them took at most this long.
+    p999: f64,
+    /// The slowest one.
+    max: f64,
+    /// What a reading of the clock took: it is part of each time.
+    clock: f64,
+}
+
+impl Tails {
+    fn read(dir: &Path) -> Option<Tails> {
+        let json: Value =
+            serde_json::from_slice(&std::fs::read(dir.join("tails.json")).ok()?).ok()?;
+        Some(Tails {
+            p50: json["p50"].as_f64()?,
+            p99: json["p99"].as_f64()?,
+            p999: json["p999"].as_f64()?,
+            max: json["max"].as_f64()?,
+            clock: json["clock"].as_f64()?,
+        })
+    }
 }
 
 impl Estimate {
@@ -609,10 +679,44 @@ fn estimate(dir: &Path) -> Option<Estimate> {
         hi: m["confidence_interval"]["upper_bound"].as_f64()?,
         write_hz: writes["hz"].as_f64(),
         write_target_hz: writes["target_hz"].as_f64(),
+        tails: Tails::read(dir),
     })
 }
 
-/// All results of one subject in one group, by reader count.
+/// A benchmark that was not measured, because with more threads than CPUs the threads it
+/// would have timed got nowhere.
+struct Stalled {
+    /// The operations the slowest of them got done.
+    done: f64,
+    /// In this many seconds.
+    secs: f64,
+}
+
+/// The reader counts at which one subject stalled in one group.
+fn stalled(dir: &Path, group: &str, subject: &str) -> BTreeMap<u32, Stalled> {
+    let mut all = BTreeMap::new();
+    let Ok(entries) = std::fs::read_dir(dir.join(group).join(subject)) else {
+        return all;
+    };
+    for entry in entries.flatten() {
+        let Some(readers) = entry.file_name().to_str().and_then(|n| n.parse().ok()) else {
+            continue;
+        };
+        let json: Option<Value> = std::fs::read(entry.path().join("stalled.json"))
+            .ok()
+            .and_then(|b| serde_json::from_slice(&b).ok());
+        if let Some(json) = json {
+            let (Some(done), Some(secs)) = (json["done"].as_f64(), json["secs"].as_f64()) else {
+                continue;
+            };
+            all.insert(readers, Stalled { done, secs });
+        }
+    }
+    all
+}
+
+/// All results of one subject in one group, by reader count. A benchmark that stalled has
+/// none, whatever an earlier run left.
 fn estimates(dir: &Path, group: &str, subject: &str) -> BTreeMap<u32, Estimate> {
     let mut all = BTreeMap::new();
     let Ok(entries) = std::fs::read_dir(dir.join(group).join(subject)) else {
@@ -622,6 +726,9 @@ fn estimates(dir: &Path, group: &str, subject: &str) -> BTreeMap<u32, Estimate> 
         let Some(readers) = entry.file_name().to_str().and_then(|n| n.parse().ok()) else {
             continue;
         };
+        if entry.path().join("stalled.json").exists() {
+            continue;
+        }
         if let Some(e) = estimate(&entry.path()) {
             all.insert(readers, e);
         }
@@ -714,23 +821,82 @@ fn markdown(dir: &Path) -> bool {
         println!("| Subject | {} |", head.join(" | "));
         println!("|---|{}", "---:|".repeat(counts.len()));
         let mut short = Vec::new();
-        for (name, e) in rows {
+        let mut stuck = Vec::new();
+        for (name, e) in &rows {
+            let stalled = stalled(dir, g.id, name);
+            for (c, s) in &stalled {
+                stuck.push(format!(
+                    "`{name}` at R = {c} ({} {}s in {} s)",
+                    s.done, g.op, s.secs
+                ));
+            }
             for (c, e) in e.iter().filter(|(_, e)| e.writer_short()) {
                 let hz = fmt_count(e.write_hz.unwrap_or(0.0));
                 short.push(format!("`{name}` at R = {c} ({hz})"));
             }
             let cells: Vec<_> = counts
                 .iter()
-                .map(|c| e.get(c).map_or("—".into(), fmt_cell))
+                .map(|c| match e.get(c) {
+                    Some(e) => fmt_cell(e),
+                    None if stalled.contains_key(c) => "stalled ‡".into(),
+                    None => "—".into(),
+                })
                 .collect();
             println!("| `{name}` | {} |", cells.join(" | "));
         }
         println!();
+        if !stuck.is_empty() {
+            println!(
+                "‡ Not measured: beside that many threads the {} got next to nowhere. {}.\n",
+                if g.op == "write" { "writer" } else { "readers" },
+                stuck.join(", ")
+            );
+        }
+        let over: Vec<_> = counts
+            .iter()
+            .filter(|&&c| g.oversubscribed(c))
+            .map(|c| format!("R = {c}"))
+            .collect();
+        if !over.is_empty() {
+            println!(
+                "{} is more threads than this machine has CPUs ({}): they take turns.\n",
+                over.join(", "),
+                cpus().unwrap_or(0)
+            );
+        }
         if !short.is_empty() {
             println!(
                 "† The writer did not reach the rate. Writes per second it did reach: {}.\n",
                 short.join(", ")
             );
+        }
+        let clock = rows
+            .iter()
+            .flat_map(|(_, e)| e.values())
+            .find_map(|e| e.tails.as_ref().map(|t| t.clock));
+        if let Some(clock) = clock {
+            println!(
+                "The slow {op}s: 99% of the {op}s took at most the first time, 99.9% the \
+                 second, and the third is the slowest one. Every {op} was timed on its own \
+                 for this, and each time includes one reading of the clock (about {}).\n",
+                fmt_ns(clock),
+                op = g.op
+            );
+            println!("| Subject | {} |", head.join(" | "));
+            println!("|---|{}", "---:|".repeat(counts.len()));
+            for (name, e) in &rows {
+                let cells: Vec<_> = counts
+                    .iter()
+                    .map(|c| match e.get(c).and_then(|e| e.tails.as_ref()) {
+                        Some(t) => {
+                            format!("{} / {} / {}", fmt_ns(t.p99), fmt_ns(t.p999), fmt_ns(t.max))
+                        }
+                        None => "—".into(),
+                    })
+                    .collect();
+                println!("| `{name}` | {} |", cells.join(" | "));
+            }
+            println!();
         }
     }
     if found {
@@ -795,8 +961,18 @@ fn json(dir: &Path) -> bool {
                             v["write_hz"] = json!(hz);
                             v["writer_short"] = json!(e.writer_short());
                         }
+                        if let Some(t) = &e.tails {
+                            v["each"] = json!({
+                                "p50": t.p50, "p99": t.p99, "p999": t.p999, "max": t.max,
+                                "clock": t.clock,
+                            });
+                        }
                         (r.to_string(), v)
                     })
+                    .chain(stalled(dir, g.id, s.name).into_iter().map(|(r, s)| {
+                        let v = json!({ "stalled": true, "done": s.done, "secs": s.secs });
+                        (r.to_string(), v)
+                    }))
                     .collect();
                 if !by_readers.is_empty() {
                     found = true;
@@ -832,7 +1008,10 @@ fn json(dir: &Path) -> bool {
         .map(|g| {
             let write_hz = g.write_hz(dir);
             let (title, desc) = g.text(write_hz);
-            json!({ "id": g.id, "title": title, "desc": desc, "op": g.op, "write_hz": write_hz })
+            json!({
+                "id": g.id, "title": title, "desc": desc, "op": g.op, "write_hz": write_hz,
+                "writer_threads": g.writer_threads, "readers_busy": g.readers_busy,
+            })
         })
         .collect();
     let doc = json!({

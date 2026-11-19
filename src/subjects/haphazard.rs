@@ -32,8 +32,8 @@ impl Subject for Haphazard {
     }
 
     #[inline]
-    fn read(r: &mut Self::Reader) -> u64 {
-        let v = r.cell.safe_load(&mut r.hp).unwrap().get();
+    fn read_with<T>(r: &mut Self::Reader, f: impl FnOnce(&Val) -> T) -> T {
+        let v = f(r.cell.safe_load(&mut r.hp).unwrap());
         r.hp.reset_protection();
         v
     }

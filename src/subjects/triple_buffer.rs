@@ -18,8 +18,8 @@ impl Subject for TripleBuffer {
     }
 
     #[inline]
-    fn read(r: &mut Self::Reader) -> u64 {
-        r.read().get()
+    fn read_with<T>(r: &mut Self::Reader, f: impl FnOnce(&Val) -> T) -> T {
+        f(r.read())
     }
 
     #[inline]

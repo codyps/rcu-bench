@@ -124,6 +124,7 @@ td span.short { margin-left: 0.25em; }
 #chart .far { stroke-width: 1.5; stroke-dasharray: 1 4; stroke-linecap: round; opacity: 0.55; }
 #chart .slowest { fill: var(--surface); stroke-width: 1.5; opacity: 0.7; }
 #chart .spread { opacity: 0.5; }
+#chart .dot-each { fill: var(--surface); stroke-width: 1.5; stroke-linejoin: round; }
 #chart .floor { fill: var(--wash); }
 #chart .floorline { stroke: var(--axis); stroke-width: 1; stroke-dasharray: 3 3; }
 #chart .head { fill: var(--muted); font-size: 11.5px; }
@@ -237,6 +238,13 @@ ul.caveats li { margin-bottom: 4px; }
         <span id="lbl-stat">Compare by</span>
         <div class="seg" id="stats" role="group" aria-labelledby="lbl-stat"></div>
       </div>
+      <div class="control" id="ctl-timing" hidden>
+        <span id="lbl-timing">Single timings</span>
+        <div class="seg" id="timings" role="group" aria-labelledby="lbl-timing">
+          <button type="button" data-timing="corrected" title="Less what timing one cost in that row">Corrected</button>
+          <button type="button" data-timing="raw" title="With the cost of timing each one in them">As measured</button>
+        </div>
+      </div>
       <div class="control">
         <span id="lbl-scale">Scale</span>
         <div class="seg" id="scales" role="group" aria-labelledby="lbl-scale">
@@ -315,9 +323,12 @@ ul.caveats li { margin-bottom: 4px; }
         was also timed on its own for half a second. On the log scale each row then has a line with a triangle under the median, which runs
         on to the time that 99.9% of them stayed within, with a tick down at 99%, and on in dots to the slowest one. “Compare by” picks which of those the rows
         are sorted by and compared with local-rcu by, and which one the chart of the reader counts shows. Each of those times
-        includes one reading of the clock, a few tens of nanoseconds, and the shaded part of the chart is faster than any of
-        them was: for the fastest subjects they say more about the clock than about the read, and what they are for is the
-        stalls of microseconds and more. The shape that rises from that line is where the timings are, as high as there are many of them
+        includes what timing it cost, about one reading of the clock: a few tens of nanoseconds, where a read can take less than one.
+        “Corrected” takes that off. What it came to in a row is how far the median of its single timings is above its median, and
+        every one of them is moved down by that, so that the two medians meet; one that comes out below the median is put at
+        the median. The clock counts in steps of nanoseconds, so close to the median the shape is only as fine as those steps, and
+        what the timings are for is the stalls of microseconds and more. “As measured” shows them with the cost in them: all of them
+        are then later than the median, a hollow triangle marks the median they have among themselves, and the shaded part of the chart is faster than any of them was. The shape that rises from that line is where the timings are, as high as there are many of them
         at that time, and the chart below the ranked one has all of them for local-rcu and for the row you click. The slowest one is a single read or write of a short run on a shared machine, and
         mostly a matter of which thread lost its CPU.</li>
       <li><span class="hold">◆</span> and <span class="hold">◇</span> mark subjects whose readers keep old values alive while idle.
@@ -372,6 +383,7 @@ const state = {
   readers: null,
   stat: "median",
   scale: "log",
+  timing: "corrected",
   mode: "abs",
   hidden: new Set(),
   pinned: null,
@@ -503,7 +515,7 @@ const group = () => run().groups.find((g) => g.id === state.op);
 /* What to show of a result. "median" is criterion's time per operation. The others are in
    `each`, which a result has unless that was turned off for the run: every read (or write) was timed on its own
    there, and `p99`, `p999` and `max` are what 99% and 99.9% of them stayed within and the
-   slowest one. Each of those times includes one reading of the clock (`clock`).
+   slowest one. Each of those times includes one reading of the clock (`clock`): see `corrected`.
    The ranked chart draws all of them in each row; the chosen one is what it sorts and compares
    by, and what the chart of the reader counts shows. */
 const STATS = [
@@ -516,7 +528,7 @@ const hasEach = (op) => run().subjects.some((s) => Object.values(s.results[op] |
 /* the results of one subject for an operation; for the current one, as the chosen value */
 function series(s, op) {
   const all = s.results[op || state.op] || {}, raw = {};
-  for (const r in all) if (!all[r].stalled) raw[r] = all[r];
+  for (const r in all) if (!all[r].stalled) raw[r] = state.timing === "raw" ? all[r] : corrected(all[r]);
   if (op || state.stat === "median") return raw;
   const out = {};
   for (const r in raw) {
@@ -524,6 +536,31 @@ function series(s, op) {
     const v = raw[r].each[state.stat];
     out[r] = { ...raw[r], median: v, lo: v, hi: v };
   }
+  return out;
+}
+/* A single timing includes what timing it cost: about one reading of the clock, tens of
+   nanoseconds, where a read can take less than one. So the single timings of a result are all
+   later than its median, which criterion gets from many operations between two readings.
+   What timing one cost there is how far the median of the single timings (`p50`) is above
+   criterion's, and this is the result with that (`each.off`) taken off every one of them. A
+   timing that comes out below the median is put at the median: the clock cannot tell how much
+   faster than usual it was. The buckets of the histogram are moved the same way (`each.bs`). */
+const correctedCache = new WeakMap();
+function corrected(v) {
+  if (!v.each || v.each.p50 == null) return v;
+  let out = correctedCache.get(v);
+  if (out) return out;
+  const e = v.each, off = Math.max(0, e.p50 - v.median), at = (t) => Math.max(v.median, t - off);
+  const bs = [];
+  for (const b of rawBuckets(e)) {
+    const lo = at(b.lo), hi = at(b.hi), last = bs[bs.length - 1];
+    if (hi <= lo) { if (last && last.hi <= last.lo) last.n += b.n; else bs.push({ lo, hi, n: b.n }); continue; }
+    /* the first bucket with a width takes the timings that were put at the median */
+    if (last && last.hi <= last.lo) { bs.pop(); bs.push({ lo, hi, n: b.n + last.n }); } else bs.push({ lo, hi, n: b.n });
+  }
+  for (const b of bs) { if (b.hi <= b.lo) b.hi = b.lo * 1.0905; b.w = Math.log2(b.hi / b.lo); }
+  out = { ...v, each: { ...e, off, p50: at(e.p50), p99: at(e.p99), p999: at(e.p999), max: at(e.max), bs } };
+  correctedCache.set(v, out);
   return out;
 }
 /* A result with `stalled` was not measured: with more threads than CPUs, the threads that would
@@ -555,7 +592,8 @@ const machineLabel = (m) => m.label || m.arch || "run";
 /* `each.hist` counts the single timings in buckets, as [key, count, key, count, ...]. Bucket
    `key` starts at 2^(key >> 3) * (1 + (key & 7) / 8) ns and ends where the next one starts. */
 const bucketLo = (k) => Math.pow(2, k >> 3) * (1 + (k & 7) / 8);
-function buckets(e) {
+const buckets = (e) => (e && e.bs) || rawBuckets(e);
+function rawBuckets(e) {
   const out = [];
   if (!e || !e.hist) return out;
   for (let i = 0; i + 1 < e.hist.length; i += 2) {
@@ -615,6 +653,11 @@ function renderControls() {
     b.setAttribute("aria-pressed", String(b.dataset.scale === state.scale));
     b.onclick = () => { state.scale = b.dataset.scale; update(); };
   }
+  $("#ctl-timing").hidden = !hasEach(state.op);
+  for (const b of document.querySelectorAll("#timings button")) {
+    b.setAttribute("aria-pressed", String(b.dataset.timing === state.timing));
+    b.onclick = () => { state.timing = b.dataset.timing; update(); };
+  }
   for (const b of document.querySelectorAll("#modes button")) {
     b.setAttribute("aria-pressed", String(b.dataset.mode === state.mode));
     b.onclick = () => { state.mode = b.dataset.mode; update(); };
@@ -672,12 +715,14 @@ function linearScale(max) {
 function renderChart() {
   const g = group();
   const all = run().subjects;
-  const tails = hasEach(state.op), clock = clockCost();
+  const tails = hasEach(state.op), clock = clockCost(), raw = state.timing === "raw";
   /* the tails are drawn on the log scale only: on the linear one they would flatten every bar */
   const ranges = tails && state.scale === "log";
   $("#chart-title").textContent = `${g.title}, ${readersLabel(state.readers)}: time per ${g.op}` + (ranges ? ", and how slow the slow ones are" : "");
   $("#chart-desc").textContent = scenarioText()
-    + (ranges ? ` The slow ${g.op}s come from timing every ${g.op} on its own` + (clock ? `, which adds one reading of the clock (about ${fmt(clock)}) to each: the shaded part is faster than any of them was.` : ".") : "")
+    + (ranges ? ` The slow ${g.op}s come from timing every ${g.op} on its own` + (!clock ? "."
+      : raw ? `, which adds one reading of the clock (about ${fmt(clock)}) to each: they are as measured, so all of them are later than the median, and the shaded part is faster than any of them was.`
+      : `, which adds about one reading of the clock (${fmt(clock)}) to each. What that came to in a row, the median of its single timings less its median, is taken off them.`) : "")
     + (tails && !ranges ? " The linear scale shows the median only." : "")
     + (state.scale === "log" ? " Log scale: each labelled gridline is 10× the one before." : "");
   renderKey(ranges, g, ranges && all.some((s) => measured(s) && measured(s).each && measured(s).each.hist));
@@ -726,7 +771,7 @@ function renderChart() {
   /* Nothing timed on its own is much faster than one reading of the clock, and that part is
      shaded. `clock` is what a reading usually costs and some cost less, so the shading stops
      at the fastest timing there is: it never lies behind a histogram. */
-  const floor = !ranges || !clock ? null : Math.min(clock, ...rows.map((s) => { const b = buckets(measured(s).each)[0]; return b ? b.lo : Infinity; }));
+  const floor = !ranges || !clock || !raw ? null : Math.min(clock, ...rows.map((s) => { const b = buckets(measured(s).each)[0]; return b ? b.lo : Infinity; }));
   if (floor && scale.pos(floor) > 0) {
     root.append(svg("rect", { class: "floor", x: plotX, y: top - 6, width: x(floor) - plotX, height: H - top }));
     root.append(svg("line", { class: "floorline", x1: x(floor), x2: x(floor), y1: top - 6, y2: H - 6 }));
@@ -754,6 +799,7 @@ function renderChart() {
       class: "row" + (s.name === state.pinned ? " pinned" : ""),
       tabindex: 0, role: "listitem",
       "aria-label": `${s.name}: ${fmt(r.median)}`
+        + (raw && r.each && r.each.p50 != null ? `, median timed one by one ${fmt(r.each.p50)}` : "")
         + (r.each ? `, 99% within ${fmt(r.each.p99)}, 99.9% within ${fmt(r.each.p999)}, slowest ${fmt(r.each.max)}` : "")
         + (ratio && s.name !== SELF ? `, ${fmtRatio(ratio)} local-rcu` : "")
         + holdAria(s) + batchAria(s) + (copies(s) ? ", only holds Copy values" : "")
@@ -793,6 +839,8 @@ function renderChart() {
           row.append(svg("circle", { class: "slowest", cx: xmax, cy: by, r: 3, stroke: color }));
         } else if (x2 - x1 > 1) row.append(svg("line", { class: "whisker", x1, x2, y1: by, y2: by, stroke: color }));
         row.append(svg("path", { class: "dot", d: `M${xm},${by + 0.5}l5,7.5h-10z`, fill: color }));
+        /* as measured, the single timings have a median of their own, later than the row's */
+        if (raw && e && e.p50 != null) row.append(svg("path", { class: "dot-each", d: `M${x(e.p50)},${by + 1}l4.5,7h-9z`, stroke: color }));
       } else {
         if (x2 - x1 > 1) row.append(svg("line", { class: "whisker", x1, x2, y1: cy, y2: cy, stroke: color }));
         row.append(svg("circle", { class: "dot", cx: x(r.median), cy, r: 6, fill: color }));
@@ -862,6 +910,7 @@ function renderKey(shown, g, spread) {
   const base = (x1, x2, extra) => svg("line", { x1, x2, y1: 7, y2: 7, stroke: c, "stroke-width": 1.5, ...extra });
   const down = (len) => svg("line", { x1: 13, x2: 13, y1: 7, y2: 7 + len, stroke: c, "stroke-width": 1.5, "stroke-linecap": "round" });
   item("median", base(2, 24), svg("path", { d: "M13,7.5l5,7.5h-10z", fill: c }));
+  if (state.timing === "raw") item(`median of the ${g.op}s timed one by one`, base(2, 24), svg("path", { d: "M13,8l4.5,7h-9z", fill: "none", stroke: c, "stroke-width": 1.5, "stroke-linejoin": "round" }));
   if (spread) item(`how many ${g.op}s took that long`, svg("path", { d: "M2,13V11H6V7H10V2H14V5H18V10H22V12H24V13Z", fill: c, opacity: 0.55 }));
   item(`99% of the ${g.op}s within`, base(2, 24), down(3.5));
   item("99.9% within", base(2, 13), down(6));
@@ -908,7 +957,7 @@ function renderDist() {
     "aria-label": `How long the single ${g.op}s of ${shown.map((d) => d.s.name).join(" and ")} took: 99% within ${fmt(main.e.p99)}, 99.9% within ${fmt(main.e.p999)}, slowest ${fmt(main.e.max)} for ${main.s.name}.` });
 
   /* shaded up to the fastest timing drawn, as in the ranked chart */
-  const clock = main.e.clock, floor = clock ? Math.min(clock, ...shown.map((d) => d.bs[0].lo)) : null;
+  const clock = main.e.clock, raw = state.timing === "raw", floor = clock && raw ? Math.min(clock, ...shown.map((d) => d.bs[0].lo)) : null;
   if (floor && scale.pos(floor) > 0) root.append(svg("rect", { class: "floor", x: padL, y: top, width: x(floor) - padL, height: plotH }));
   const pct = (e) => (e >= 0 ? "100%" : e >= -2 ? `${Math.pow(10, e + 2)}%` : `0.${"0".repeat(-e - 3)}1%`);
   const step = yHi - Math.ceil(yLo) > 5 ? 2 : 1;
@@ -946,8 +995,10 @@ function renderDist() {
     if (mx - lastLabel > 44) { root.append(svg("text", { class: "marklabel", x: mx, y: top - 8, "text-anchor": "middle" }, label)); lastLabel = mx; }
   }
   host.append(root);
-  note.textContent = `The dashed lines are ${main.s.name}'s.` + (clock ? ` Each time includes one reading of the clock (about ${fmt(clock)}): the shaded part is faster than any of them was.` : "")
-    + " A bucket is an eighth of a doubling wide.";
+  const offs = shown.filter((d) => d.e.off != null).map((d) => `${fmt(d.e.off)} for ${d.s.name}`).join(" and ");
+  note.textContent = `The dashed lines are ${main.s.name}'s.`
+    + (raw ? (clock ? ` Each time includes one reading of the clock (about ${fmt(clock)}): the shaded part is faster than any of them was.` : "") + " A bucket is an eighth of a doubling wide."
+      : ` What timing one ${g.op} cost is taken off each time (${offs}), and one that comes out below the median is put at the median. A bucket was an eighth of a doubling wide before that.`);
 }
 function fitNames(root, sel, max) {
   for (const t of root.querySelectorAll(sel)) {
@@ -1101,9 +1152,11 @@ function showRowTip(s, ratio, ev, anchor) {
   const add = (k, v) => { dl.append(el("dt", {}, k), el("dd", {}, v)); };
   if (r.lo !== r.hi) add("95% CI", `${fmt(r.lo)} – ${fmt(r.hi)}`);
   if (r.each) {
+    if (state.timing === "raw" && r.each.p50 != null) add("Median, timed one by one", fmt(r.each.p50));
     add("99% within", fmt(r.each.p99));
     add("99.9% within", fmt(r.each.p999));
     add("Slowest", fmt(r.each.max));
+    if (r.each.off != null) add("Taken off each", fmt(r.each.off));
   }
   if (r.write_hz != null) add("Writes", writesText(r));
   if (ratio && s.name !== SELF) add(state.stat === "median" ? "vs local-rcu" : `vs local-rcu, ${statLabel(state.stat)}`, ratio >= 1 ? `${fmtRatio(ratio)} slower` : `${fmtRatio(1 / ratio)} faster`);
@@ -1252,6 +1305,7 @@ function update() {
   p.set("r", state.readers);
   if (state.stat !== "median") p.set("v", state.stat);
   if (state.scale !== "log") p.set("scale", state.scale);
+  if (state.timing !== "corrected") p.set("t", state.timing);
   if (state.mode !== "abs") p.set("y", state.mode);
   if (state.pinned) p.set("pin", state.pinned);
   history.replaceState(null, "", "#" + p.toString());
@@ -1265,6 +1319,7 @@ function restore() {
   if (p.get("r") != null && p.get("r") !== "") state.readers = +p.get("r");
   if (p.get("v")) state.stat = p.get("v");
   if (p.get("scale") === "linear") state.scale = "linear";
+  if (p.get("t") === "raw") state.timing = "raw";
   if (p.get("y") === "rel") state.mode = "rel";
   const pin = p.get("pin");
   if (pin && run().subjects.some((x) => x.name === pin)) state.pinned = pin;

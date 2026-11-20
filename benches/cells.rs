@@ -266,6 +266,8 @@ fn progress<S: Subject>(readers: usize, timed: Timed) -> Result<(), u64> {
                 S::write(&mut w, Val::new(i));
                 n.fetch_add(1, Ordering::Relaxed);
             }
+            // handed back, not dropped here: see below
+            w
         })
     };
 
@@ -286,7 +288,10 @@ fn progress<S: Subject>(readers: usize, timed: Timed) -> Result<(), u64> {
     for t in reader_threads {
         t.join().unwrap();
     }
-    writer_thread.join().unwrap();
+    // The writer's handle outlives the readers: some subjects stop handing out values once it
+    // is gone, and a reader that was still reading then would find none (left-right's
+    // `enter()` is `None`).
+    drop(writer_thread.join().unwrap());
     if got < PROGRESS_OPS {
         Err(got)
     } else {

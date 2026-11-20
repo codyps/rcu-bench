@@ -82,6 +82,8 @@ jobs:
       # process for all groups it used up the runner's memory.
       - name: Run benchmarks
         run: |
+          # a listing that fails must fail the step, not leave the groups before it
+          set -o pipefail
           groups=$(cargo bench --bench cells -- --list | sed -n 's|^\([a-z-]*\)/.*: benchmark$|\1|p' | uniq)
           test -n "$groups"
           for group in $groups; do

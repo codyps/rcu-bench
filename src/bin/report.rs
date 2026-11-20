@@ -641,6 +641,9 @@ struct Tails {
     max: f64,
     /// What a reading of the clock took: it is part of each time.
     clock: f64,
+    /// How many of them took how long, as the benchmark wrote it: `[key, count, ...]`, where
+    /// a bucket starts at `2^(key / 8) * (1 + (key % 8) / 8)` ns and ends where the next starts.
+    hist: Option<Value>,
 }
 
 impl Tails {
@@ -653,6 +656,7 @@ impl Tails {
             p999: json["p999"].as_f64()?,
             max: json["max"].as_f64()?,
             clock: json["clock"].as_f64()?,
+            hist: json.get("hist").filter(|h| h.is_array()).cloned(),
         })
     }
 }
@@ -969,6 +973,9 @@ fn json(dir: &Path) -> bool {
                                 "p50": t.p50, "p99": t.p99, "p999": t.p999, "max": t.max,
                                 "clock": t.clock,
                             });
+                            if let Some(h) = &t.hist {
+                                v["each"]["hist"] = h.clone();
+                            }
                         }
                         (r.to_string(), v)
                     })

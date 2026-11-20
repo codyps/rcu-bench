@@ -667,6 +667,36 @@ impl Histogram {
         self.max = self.max.max(other.max);
     }
 
+    /// The shortest time that goes into `bucket`.
+    fn lower(bucket: usize) -> u64 {
+        if bucket < 16 {
+            return bucket as u64;
+        }
+        (16 + (bucket % 16) as u64) << (bucket / 16 - 1)
+    }
+
+    /// The counts for the results page, as `[key, count, key, count, ...]` without the empty
+    /// ones. These buckets are coarser, 8 for every doubling: `key / 8` is the power of two
+    /// and `key % 8` the eighth above it, so a bucket starts at `2^(key / 8) * (1 + (key % 8) / 8)`
+    /// nanoseconds and ends where the next one starts. Key 0 also has the times below 1 ns.
+    fn coarse(&self) -> Vec<u64> {
+        let mut out: Vec<u64> = Vec::new();
+        for (i, &n) in self.buckets.iter().enumerate() {
+            if n == 0 {
+                continue;
+            }
+            let ns = Self::lower(i).max(1);
+            let exp = 63 - ns.leading_zeros() as u64;
+            // the eighth of the doubling that `ns` is in: (ns / 2^exp - 1) * 8, rounded down
+            let key = exp * 8 + (((ns - (1 << exp)) * 8) >> exp);
+            match out.len() {
+                l if l >= 2 && out[l - 2] == key => out[l - 1] += n,
+                _ => out.extend([key, n]),
+            }
+        }
+        out
+    }
+
     /// The time that the share `q` of the operations stayed at or below.
     fn quantile(&self, q: f64) -> u64 {
         let wanted = ((q * self.count as f64).ceil() as u64).clamp(1, self.count.max(1));
@@ -704,9 +734,9 @@ fn time_each(time: Duration, mut op: impl FnMut()) -> Histogram {
     }
 }
 
-/// `readers` threads read for `time`, each read timed on its own, while a writer publishes as
-/// fast as it can. Returns the times of all the reads.
-fn tail_read<S: Subject>(readers: usize, time: Duration) -> Histogram {
+/// `readers` threads read for `time`, each read timed on its own, beside the writer that
+/// `load` asks for. Returns the times of all the reads.
+fn tail_read<S: Subject>(readers: usize, time: Duration, load: WriterLoad) -> Histogram {
     let (mut w, rs) = S::new(Val::new(0), readers);
     let start = Arc::new(Barrier::new(readers + 1));
     let stop = Arc::new(AtomicBool::new(false));
@@ -728,11 +758,25 @@ fn tail_read<S: Subject>(readers: usize, time: Duration) -> Histogram {
         let stop = stop.clone();
         std::thread::spawn(move || {
             start.wait();
-            let mut i = 0;
-            while !stop.load(Ordering::Relaxed) {
-                i += 1;
-                S::write(&mut w, Val::new(i));
+            match load {
+                // keep the writer's half of the cell until the readers are done
+                WriterLoad::None => {
+                    while !stop.load(Ordering::Relaxed) {
+                        std::thread::park();
+                    }
+                }
+                WriterLoad::Flat => {
+                    let mut i = 0;
+                    while !stop.load(Ordering::Relaxed) {
+                        i += 1;
+                        S::write(&mut w, Val::new(i));
+                    }
+                }
+                WriterLoad::Paced(interval) => {
+                    paced_writes::<S>(&mut w, interval, &stop);
+                }
             }
+            drop(w);
         })
     };
 
@@ -741,13 +785,14 @@ fn tail_read<S: Subject>(readers: usize, time: Duration) -> Histogram {
         all.merge(&t.join().unwrap());
     }
     stop.store(true, Ordering::Relaxed);
+    writer_thread.thread().unpark();
     writer_thread.join().unwrap();
     all
 }
 
-/// The writer writes for `time`, each write timed on its own, while `readers` threads read as
-/// fast as they can. Returns the times of the writes.
-fn tail_write<S: Subject>(readers: usize, time: Duration) -> Histogram {
+/// The writer writes for `time`, each write timed on its own, beside `readers` threads that
+/// do what `load` asks for. Returns the times of the writes.
+fn tail_write<S: Subject>(readers: usize, time: Duration, load: ReaderLoad) -> Histogram {
     let (mut w, rs) = S::new(Val::new(0), readers);
     let start = Arc::new(Barrier::new(readers + 1));
     let stop = Arc::new(AtomicBool::new(false));
@@ -757,10 +802,34 @@ fn tail_write<S: Subject>(readers: usize, time: Duration) -> Histogram {
         .map(|mut r| {
             let start = start.clone();
             let stop = stop.clone();
-            std::thread::spawn(move || {
-                start.wait();
-                while !stop.load(Ordering::Relaxed) {
+            std::thread::spawn(move || match load {
+                ReaderLoad::Flat => {
+                    start.wait();
+                    while !stop.load(Ordering::Relaxed) {
+                        black_box(S::read(&mut r));
+                    }
+                }
+                // read once, then sleep without giving up the handle
+                ReaderLoad::Idle => {
                     black_box(S::read(&mut r));
+                    start.wait();
+                    while !stop.load(Ordering::Relaxed) {
+                        std::thread::park();
+                    }
+                    drop(r);
+                }
+                ReaderLoad::Held(hold) => {
+                    start.wait();
+                    while !stop.load(Ordering::Relaxed) {
+                        black_box(S::read_with(&mut r, |v| {
+                            let v = v.get();
+                            let until = Instant::now() + hold;
+                            while Instant::now() < until {
+                                std::hint::spin_loop();
+                            }
+                            v
+                        }));
+                    }
                 }
             })
         })
@@ -775,6 +844,7 @@ fn tail_write<S: Subject>(readers: usize, time: Duration) -> Histogram {
 
     stop.store(true, Ordering::Relaxed);
     for t in reader_threads {
+        t.thread().unpark();
         t.join().unwrap();
     }
     h
@@ -828,7 +898,7 @@ fn tail_one<S: Subject>(
     counts: &[usize],
     time: Duration,
     clock: u64,
-    run: fn(usize, Duration) -> Histogram,
+    run: impl Fn(usize, Duration) -> Histogram,
 ) {
     for &readers in counts {
         let id = format!("{group}/{}/{readers}", S::NAME);
@@ -854,13 +924,13 @@ fn tail_one<S: Subject>(
         );
         let doc = serde_json::json!({
             "count": h.count, "p50": p50, "p99": p99, "p999": p999, "max": h.max,
-            "clock": clock,
+            "clock": clock, "hist": h.coarse(),
         });
         write_beside_criterion(group, S::NAME, readers, "tails.json", &doc);
     }
 }
 
-/// `read-writer` and `write` once more, with every operation timed on its own.
+/// Every group once more, with every operation timed on its own.
 fn tails() {
     let ms: u64 = match std::env::var("RCU_BENCH_TAIL_MS") {
         Ok(v) => v.parse().expect("RCU_BENCH_TAIL_MS must be a number"),
@@ -878,24 +948,47 @@ fn tails() {
     let clock = time_each(Duration::from_millis(50), || {}).quantile(0.5);
 
     let max = max_readers().max(2);
+    let alone = reader_counts(max);
     let beside_writer = reader_counts(max - 1);
     let mut for_write = vec![0];
     for_write.extend(&beside_writer);
-    let reads = with_oversubscribed(&beside_writer);
+    let flat = with_oversubscribed(&beside_writer);
     let writes = with_oversubscribed(&for_write);
+    let paced = WriterLoad::Paced(write_interval("RCU_BENCH_WRITE_HZ", 1_000_000.0));
+    let idle = idle_counts();
+    let held = ReaderLoad::Held(rcu_bench::hold_time());
 
-    macro_rules! read {
-        ($t:ty) => {
-            tail_one::<$t>("read-writer", &reads, time, clock, tail_read::<$t>);
-        };
+    // the groups in the order criterion ran them, each for all subjects
+    macro_rules! read_tails {
+        ($group:literal, $counts:expr, $load:expr) => {{
+            macro_rules! one {
+                ($t:ty) => {
+                    tail_one::<$t>($group, $counts, time, clock, |r, t| {
+                        tail_read::<$t>(r, t, $load)
+                    });
+                };
+            }
+            for_each_subject!(one);
+        }};
     }
-    for_each_subject!(read);
-    macro_rules! write {
-        ($t:ty) => {
-            tail_one::<$t>("write", &writes, time, clock, tail_write::<$t>);
-        };
+    macro_rules! write_tails {
+        ($group:literal, $counts:expr, $load:expr) => {{
+            macro_rules! one {
+                ($t:ty) => {
+                    tail_one::<$t>($group, $counts, time, clock, |r, t| {
+                        tail_write::<$t>(r, t, $load)
+                    });
+                };
+            }
+            for_each_subject!(one);
+        }};
     }
-    for_each_subject!(write);
+    read_tails!("read", &alone, WriterLoad::None);
+    read_tails!("read-writer", &flat, WriterLoad::Flat);
+    read_tails!("read-paced", &beside_writer, paced);
+    write_tails!("write", &writes, ReaderLoad::Flat);
+    write_tails!("write-idle", &idle, ReaderLoad::Idle);
+    write_tails!("write-held", &beside_writer, held);
 }
 
 fn main() {

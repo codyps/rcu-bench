@@ -75,10 +75,12 @@ oversubscribed benchmark runs, the threads it would time get 2 seconds for
 report and the page show it as stalled, with how far it got.
 
 Criterion times many operations in a row and reports the time per operation,
-which hides the slow ones. `read-writer` and `write` are therefore run once
-more after criterion is done, with every read (or write) timed on its own, for
-half a second (`RCU_BENCH_TAIL_MS`, 0 for not at all). The report and the page
-show the time that 99% and 99.9% of them stayed within, and the slowest one.
+which hides the slow ones. Every group is therefore run once more after
+criterion is done, with every read (or write) timed on its own, for half a
+second (`RCU_BENCH_TAIL_MS`, 0 for not at all). The report and the page show
+the time that 99% and 99.9% of them stayed within, and the slowest one. The
+page also draws how many of them took how long: `tails.json`, next to
+criterion's results, has the counts in buckets an eighth of a doubling wide.
 Each of those times includes one reading of the clock (the end of one
 operation is the start of the next), a few tens of nanoseconds: for the
 fastest subjects that is most of it, and timed readers also read less often

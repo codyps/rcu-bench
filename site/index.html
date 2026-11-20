@@ -122,6 +122,7 @@ td span.short { margin-left: 0.25em; }
 #chart .under { stroke-width: 1; opacity: 0.45; }
 #chart .far { stroke-width: 1.5; stroke-dasharray: 1 4; stroke-linecap: round; opacity: 0.55; }
 #chart .slowest { fill: var(--surface); stroke-width: 1.5; opacity: 0.7; }
+#chart .spread { opacity: 0.3; }
 #chart .floor { fill: var(--wash); }
 #chart .floorline { stroke: var(--axis); stroke-width: 1; stroke-dasharray: 3 3; }
 #chart .head { fill: var(--muted); font-size: 11.5px; }
@@ -146,6 +147,17 @@ td span.short { margin-left: 0.25em; }
 #tip .t-desc { margin: 8px 0 0; color: var(--ink-2); border-top: 1px solid var(--border); padding-top: 8px; }
 
 .card + .card { margin-top: 16px; }
+#dist svg { display: block; width: 100%; overflow: visible; }
+#dist text { font: 11.5px system-ui, -apple-system, "Segoe UI", sans-serif; fill: var(--muted); font-variant-numeric: tabular-nums; }
+#dist .grid { stroke: var(--grid); stroke-width: 1; }
+#dist .base { stroke: var(--axis); stroke-width: 1; }
+#dist .floor { fill: var(--wash); }
+#dist .bars { opacity: 0.8; }
+#dist .outline { fill: none; stroke: var(--ink); stroke-width: 1.5; stroke-linejoin: round; }
+#dist .mark { stroke: var(--ink-2); stroke-width: 1; stroke-dasharray: 3 3; }
+#dist .marklabel { fill: var(--ink-2); }
+.key .box { width: 14px; height: 10px; border-radius: 2px; flex: none; }
+.key .box.line { background: none; border: 1.5px solid var(--ink); }
 #scaling { position: relative; }
 #scaling svg { display: block; width: 100%; overflow: visible; touch-action: pan-y; }
 #scaling text { font: 12.5px system-ui, -apple-system, "Segoe UI", sans-serif; fill: var(--ink-2); }
@@ -246,6 +258,18 @@ ul.caveats li { margin-bottom: 4px; }
       <p class="note" id="chart-note"></p>
     </section>
 
+    <section class="card" id="dist-card" aria-labelledby="dist-title" hidden>
+      <div class="card-head">
+        <div>
+          <h3 id="dist-title"></h3>
+          <p id="dist-desc"></p>
+        </div>
+      </div>
+      <p class="key" id="dist-key"></p>
+      <div id="dist"></div>
+      <p class="note" id="dist-note"></p>
+    </section>
+
     <section class="card" aria-labelledby="scaling-title">
       <div class="card-head">
         <div>
@@ -285,14 +309,15 @@ ul.caveats li { margin-bottom: 4px; }
         takes longer there for every subject; what differs is how much a thread that is not running holds up the others.
         A subject can stall altogether there: if its writer (or its readers) cannot get 1,000 operations done in 2 seconds, it is
         not measured and is listed as stalled.</li>
-      <li>Where no single read or write was timed, the range drawn around each dot on the log scale is criterion's 95% confidence interval for the median.</li>
-      <li>The median says nothing about the slow reads and writes. For “Read beside a writer” and “Write”, every read (or write)
+      <li>Where no single read or write was timed (a run with that turned off), the range drawn around each dot on the log scale is criterion's 95% confidence interval for the median.</li>
+      <li>The median says nothing about the slow reads and writes. So every read (or write) of every operation
         was also timed on its own for half a second. On the log scale each row then runs from the median to the time that 99.9%
         of them stayed within, with a tick at 99%, and on in dots to the slowest one. “Compare by” picks which of those the rows
         are sorted by and compared with local-rcu by, and which one the chart of the reader counts shows. Each of those times
         includes one reading of the clock, a few tens of nanoseconds, and the shaded part of the chart is where that puts them
         out of reach: for the fastest subjects they say more about the clock than about the read, and what they are for is the
-        stalls of microseconds and more. The slowest one is a single read or write of a short run on a shared machine, and
+        stalls of microseconds and more. The pale shape in a row is where the timings are, as high as there are many of them
+        at that time, and the chart below the ranked one has all of them for local-rcu and for the row you click. The slowest one is a single read or write of a short run on a shared machine, and
         mostly a matter of which thread lost its CPU.</li>
       <li><span class="hold">◆</span> and <span class="hold">◇</span> mark subjects whose readers keep old values alive while idle.
         It is measured, not declared: the writer publishes a value, one reader reads it and then does nothing, and the writer
@@ -475,7 +500,7 @@ const readersLabel = (r) => (r === 0 ? "no readers" : r === 1 ? "1 reader" : `${
 const run = () => state.runs[state.run];
 const group = () => run().groups.find((g) => g.id === state.op);
 /* What to show of a result. "median" is criterion's time per operation. The others are in
-   `each`, which the results of some operations have: every read (or write) was timed on its own
+   `each`, which a result has unless that was turned off for the run: every read (or write) was timed on its own
    there, and `p99`, `p999` and `max` are what 99% and 99.9% of them stayed within and the
    slowest one. Each of those times includes one reading of the clock (`clock`).
    The ranked chart draws all of them in each row; the chosen one is what it sorts and compares
@@ -526,6 +551,18 @@ function counts(op) {
 /* more busy threads (the readers, and the writer if there is one) than the machine has CPUs */
 const oversubscribed = (g, r) => !!(g.readers_busy && run().meta.threads && r + (g.writer_threads || 0) > run().meta.threads);
 const machineLabel = (m) => m.label || m.arch || "run";
+/* `each.hist` counts the single timings in buckets, as [key, count, key, count, ...]. Bucket
+   `key` starts at 2^(key >> 3) * (1 + (key & 7) / 8) ns and ends where the next one starts. */
+const bucketLo = (k) => Math.pow(2, k >> 3) * (1 + (k & 7) / 8);
+function buckets(e) {
+  const out = [];
+  if (!e || !e.hist) return out;
+  for (let i = 0; i + 1 < e.hist.length; i += 2) {
+    const k = e.hist[i], lo = bucketLo(k), hi = bucketLo(k + 1);
+    out.push({ lo, hi, n: e.hist[i + 1], w: Math.log2(hi / lo) });
+  }
+  return out;
+}
 /* the cost of one reading of the clock, which every single-timed read or write includes */
 function clockCost() {
   const r = run().subjects.map((s) => measured(s)).find((r) => r && r.each);
@@ -642,7 +679,7 @@ function renderChart() {
     + (ranges ? ` The slow ${g.op}s come from timing every ${g.op} on its own` + (clock ? `, which adds one reading of the clock (about ${fmt(clock)}) to each: none of them can be in the shaded part.` : ".") : "")
     + (tails && !ranges ? " The linear scale shows the median only." : "")
     + (state.scale === "log" ? " Log scale: each labelled gridline is 10× the one before." : "");
-  renderKey(ranges, g);
+  renderKey(ranges, g, ranges && all.some((s) => measured(s) && measured(s).each && measured(s).each.hist));
 
   /* sorted by the chosen value; a subject without it goes last, by its median */
   const rows = all
@@ -731,6 +768,14 @@ function renderChart() {
         const e = r.each, xm = x(r.median), x99 = x(e.p99), x999 = x(e.p999), xmax = x(e.max);
         /* the stretch below one reading of the clock is drawn thin: that much of the distance
            from the median is the clock's doing, not the subject's */
+        /* where the single timings fall: as high as there are many of them at that time */
+        const bs = buckets(e), most = Math.max(...bs.map((b) => b.n / b.w));
+        let d = "";
+        for (const b of bs) {
+          const h = 9 * (b.n / b.w) / most;
+          if (h >= 0.25) d += `M${x(b.lo)},${cy - h}H${x(b.hi)}V${cy + h}H${x(b.lo)}Z`;
+        }
+        if (d) row.append(svg("path", { class: "spread", d, fill: color }));
         const from = Math.min(xm, x99), solid = clock ? Math.max(from, Math.min(x(clock), x99)) : from;
         if (solid - from > 1) row.append(svg("line", { class: "under", x1: from, x2: solid, y1: cy, y2: cy, stroke: color }));
         row.append(svg("line", { class: "tail", x1: solid, x2: Math.max(xm, x999), y1: cy, y2: cy, stroke: color }));
@@ -789,7 +834,7 @@ function renderChart() {
   holdKey($("#chart-note"), rows);
 }
 /* what the marks of a row are, drawn the way the rows draw them */
-function renderKey(shown, g) {
+function renderKey(shown, g, spread) {
   const host = $("#chart-key");
   host.hidden = !shown;
   host.replaceChildren();
@@ -803,9 +848,91 @@ function renderKey(shown, g) {
     host.append(span);
   };
   item("median", svg("circle", { cx: 13, cy: 8, r: 5, fill: c }));
+  if (spread) item(`where most of the ${g.op}s are`, svg("path", { d: "M2,7H7V5H11V2H15V5H19V7H24V9H19V11H15V14H11V11H7V9H2Z", fill: c, opacity: 0.4 }));
   item(`99% of the ${g.op}s within`, svg("line", { x1: 2, x2: 24, y1: 8, y2: 8, stroke: c, "stroke-width": 2 }), svg("line", { x1: 13, x2: 13, y1: 4, y2: 12, stroke: c, "stroke-width": 2, "stroke-linecap": "round" }));
   item("99.9% within", svg("line", { x1: 2, x2: 13, y1: 8, y2: 8, stroke: c, "stroke-width": 2 }), svg("line", { x1: 13, x2: 13, y1: 1, y2: 15, stroke: c, "stroke-width": 2, "stroke-linecap": "round" }));
   item(`the slowest one`, svg("line", { x1: 2, x2: 14, y1: 8, y2: 8, stroke: c, "stroke-width": 1.5, "stroke-dasharray": "1 4", "stroke-linecap": "round" }), svg("circle", { cx: 20, cy: 8, r: 3.5, fill: "none", stroke: c, "stroke-width": 1.5 }));
+}
+/* ---------- distribution ---------- */
+/* Every single timing of local-rcu and of the pinned subject, as the share of them in each
+   bucket of time. Both axes are logarithmic, so that the few slow ones show. */
+function renderDist() {
+  const g = group(), card = $("#dist-card");
+  const pick = (name) => { const s = run().subjects.find((s) => s.name === name), r = s && measured(s); return r && r.each && r.each.hist ? { s, e: r.each, bs: buckets(r.each) } : null; };
+  const any = run().subjects.some((s) => { const r = measured(s); return r && r.each && r.each.hist; });
+  card.hidden = !any;
+  if (!any) return;
+  const pinned = state.pinned && state.pinned !== SELF ? pick(state.pinned) : null, self = pick(SELF);
+  const main = pinned || self, other = pinned ? self : null;
+  $("#dist-title").textContent = `${g.title}, ${readersLabel(state.readers)}: how long every single ${g.op} took`;
+  $("#dist-desc").textContent = `The share of the ${g.op}s that took each length of time. Both scales are logarithmic: each gridline up is 10× as many ${g.op}s, so the rare slow ones show beside the many fast ones. `
+    + (pinned ? "" : "Click a row of the chart above to see that subject here" + (self ? ", against local-rcu." : "."));
+  const host = $("#dist"), key = $("#dist-key"), note = $("#dist-note");
+  host.replaceChildren();
+  key.replaceChildren();
+  note.textContent = "";
+  if (!main) {
+    note.textContent = state.pinned ? `No single ${g.op} of ${state.pinned} was timed here.` : "";
+    return;
+  }
+  const keyItem = (cls, color, text) => { const sp = el("span"), box = el("span", { class: "box" + cls }); if (color) box.style.background = color; sp.append(box, text); key.append(sp); };
+  keyItem("", kindColor(main.s.kind), `${main.s.name} (${fmtCount(main.bs.reduce((a, b) => a + b.n, 0))} ${g.op}s timed)`);
+  if (other) keyItem(" line", null, `${other.s.name} (${fmtCount(other.bs.reduce((a, b) => a + b.n, 0))})`);
+
+  const shown = [main, other].filter(Boolean);
+  for (const d of shown) { d.total = d.bs.reduce((a, b) => a + b.n, 0); }
+  const share = (d, b) => b.n / d.total;
+  const W = Math.max(300, host.clientWidth), H = 220, padL = 52, padR = 14, top = 22, bottom = 26;
+  const plotW = W - padL - padR, plotH = H - top - bottom;
+  const scale = logScale(Math.min(...shown.map((d) => d.bs[0].lo)), Math.max(...shown.map((d) => d.bs[d.bs.length - 1].hi)));
+  const x = (v) => padL + Math.max(0, Math.min(1, scale.pos(v))) * plotW;
+  /* from just below one timing in all of them up to the decade above the fullest bucket */
+  const yLo = Math.log10(1 / Math.max(...shown.map((d) => d.total))) - 0.35;
+  const yHi = Math.min(0, Math.ceil(Math.log10(Math.max(...shown.flatMap((d) => d.bs.map((b) => share(d, b)))))));
+  const y = (v) => top + plotH * (1 - (Math.log10(v) - yLo) / (yHi - yLo));
+  const root = svg("svg", { viewBox: `0 0 ${W} ${H}`, height: H, role: "img",
+    "aria-label": `How long the single ${g.op}s of ${shown.map((d) => d.s.name).join(" and ")} took: 99% within ${fmt(main.e.p99)}, 99.9% within ${fmt(main.e.p999)}, slowest ${fmt(main.e.max)} for ${main.s.name}.` });
+
+  const clock = main.e.clock;
+  if (clock && scale.pos(clock) > 0) root.append(svg("rect", { class: "floor", x: padL, y: top, width: x(clock) - padL, height: plotH }));
+  const pct = (e) => (e >= 0 ? "100%" : e >= -2 ? `${Math.pow(10, e + 2)}%` : `0.${"0".repeat(-e - 3)}1%`);
+  const step = yHi - Math.ceil(yLo) > 5 ? 2 : 1;
+  for (let e = yHi; e >= yLo; e -= step) {
+    const ty = y(Math.pow(10, e));
+    root.append(svg("line", { class: "grid", x1: padL, x2: W - padR, y1: ty, y2: ty }));
+    root.append(svg("text", { x: padL - 6, y: ty + 4, "text-anchor": "end" }, pct(e)));
+  }
+  const majors = scale.ticks.filter((t) => t.major);
+  const every = Math.ceil(majors.length / Math.max(2, Math.floor(plotW / 62)));
+  majors.forEach((t, i) => {
+    root.append(svg("line", { class: "grid", x1: x(t.v), x2: x(t.v), y1: top, y2: top + plotH }));
+    if (i % every === 0) root.append(svg("text", { x: x(t.v), y: H - 8, "text-anchor": "middle" }, fmtTick(t.v)));
+  });
+  root.append(svg("line", { class: "base", x1: padL, x2: W - padR, y1: top + plotH, y2: top + plotH }));
+
+  const floorY = top + plotH;
+  let bars = "";
+  for (const b of main.bs) bars += `M${x(b.lo)},${floorY}V${y(share(main, b))}H${Math.max(x(b.hi), x(b.lo) + 0.75)}V${floorY}Z`;
+  root.append(svg("path", { class: "bars", d: bars, fill: kindColor(main.s.kind) }));
+  if (other) {
+    /* an outline over the bars: down to the floor wherever a bucket is empty */
+    let d = "", last = null;
+    for (const b of other.bs) {
+      if (last == null || Math.abs(b.lo - last) > 1e-9 * b.lo) d += (last == null ? "" : `V${floorY}`) + `M${x(b.lo)},${floorY}`;
+      d += `V${y(share(other, b))}H${x(b.hi)}`;
+      last = b.hi;
+    }
+    root.append(svg("path", { class: "outline", d: d + `V${floorY}` }));
+  }
+  let lastLabel = -Infinity;
+  for (const [label, v] of [["99%", main.e.p99], ["99.9%", main.e.p999], ["slowest", main.e.max]]) {
+    const mx = x(v);
+    root.append(svg("line", { class: "mark", x1: mx, x2: mx, y1: top - 4, y2: top + plotH }));
+    if (mx - lastLabel > 44) { root.append(svg("text", { class: "marklabel", x: mx, y: top - 8, "text-anchor": "middle" }, label)); lastLabel = mx; }
+  }
+  host.append(root);
+  note.textContent = `The dashed lines are ${main.s.name}'s.` + (clock ? ` Each time includes one reading of the clock (about ${fmt(clock)}), so nothing is in the shaded part.` : "")
+    + " A bucket is an eighth of a doubling wide.";
 }
 function fitNames(root, sel, max) {
   for (const t of root.querySelectorAll(sel)) {
@@ -1101,6 +1228,7 @@ function update() {
   hideTip();
   renderControls();
   renderChart();
+  renderDist();
   renderScaling();
   renderTable();
   const p = new URLSearchParams();
@@ -1140,7 +1268,7 @@ fetch("results.json", { cache: "no-cache" })
     let w = $("#chart").clientWidth;
     new ResizeObserver(() => {
       const nw = $("#chart").clientWidth;
-      if (nw !== w) { w = nw; hideTip(); renderChart(); renderScaling(); }
+      if (nw !== w) { w = nw; hideTip(); renderChart(); renderDist(); renderScaling(); }
     }).observe($("#chart"));
   })
   .catch((e) => {

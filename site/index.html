@@ -315,8 +315,8 @@ ul.caveats li { margin-bottom: 4px; }
         was also timed on its own for half a second. On the log scale each row then has a line with a triangle under the median, which runs
         on to the time that 99.9% of them stayed within, with a tick down at 99%, and on in dots to the slowest one. “Compare by” picks which of those the rows
         are sorted by and compared with local-rcu by, and which one the chart of the reader counts shows. Each of those times
-        includes one reading of the clock, a few tens of nanoseconds, and the shaded part of the chart is where that puts them
-        out of reach: for the fastest subjects they say more about the clock than about the read, and what they are for is the
+        includes one reading of the clock, a few tens of nanoseconds, and the shaded part of the chart is faster than any of
+        them was: for the fastest subjects they say more about the clock than about the read, and what they are for is the
         stalls of microseconds and more. The shape that rises from that line is where the timings are, as high as there are many of them
         at that time, and the chart below the ranked one has all of them for local-rcu and for the row you click. The slowest one is a single read or write of a short run on a shared machine, and
         mostly a matter of which thread lost its CPU.</li>
@@ -677,7 +677,7 @@ function renderChart() {
   const ranges = tails && state.scale === "log";
   $("#chart-title").textContent = `${g.title}, ${readersLabel(state.readers)}: time per ${g.op}` + (ranges ? ", and how slow the slow ones are" : "");
   $("#chart-desc").textContent = scenarioText()
-    + (ranges ? ` The slow ${g.op}s come from timing every ${g.op} on its own` + (clock ? `, which adds one reading of the clock (about ${fmt(clock)}) to each: none of them can be in the shaded part.` : ".") : "")
+    + (ranges ? ` The slow ${g.op}s come from timing every ${g.op} on its own` + (clock ? `, which adds one reading of the clock (about ${fmt(clock)}) to each: the shaded part is faster than any of them was.` : ".") : "")
     + (tails && !ranges ? " The linear scale shows the median only." : "")
     + (state.scale === "log" ? " Log scale: each labelled gridline is 10× the one before." : "");
   renderKey(ranges, g, ranges && all.some((s) => measured(s) && measured(s).each && measured(s).each.hist));
@@ -723,10 +723,13 @@ function renderChart() {
 
   const root = svg("svg", { viewBox: `0 0 ${W} ${H}`, height: H, role: "list", "aria-label": `${g.title}, ${readersLabel(state.readers)}, sorted fastest first` });
 
-  /* nothing timed on its own can be faster than one reading of the clock */
-  if (ranges && clock && scale.pos(clock) > 0) {
-    root.append(svg("rect", { class: "floor", x: plotX, y: top - 6, width: x(clock) - plotX, height: H - top }));
-    root.append(svg("line", { class: "floorline", x1: x(clock), x2: x(clock), y1: top - 6, y2: H - 6 }));
+  /* Nothing timed on its own is much faster than one reading of the clock, and that part is
+     shaded. `clock` is what a reading usually costs and some cost less, so the shading stops
+     at the fastest timing there is: it never lies behind a histogram. */
+  const floor = !ranges || !clock ? null : Math.min(clock, ...rows.map((s) => { const b = buckets(measured(s).each)[0]; return b ? b.lo : Infinity; }));
+  if (floor && scale.pos(floor) > 0) {
+    root.append(svg("rect", { class: "floor", x: plotX, y: top - 6, width: x(floor) - plotX, height: H - top }));
+    root.append(svg("line", { class: "floorline", x1: x(floor), x2: x(floor), y1: top - 6, y2: H - 6 }));
   }
 
   const majors = scale.ticks.filter((t) => t.major);
@@ -781,7 +784,7 @@ function renderChart() {
           if (d) row.append(svg("path", { class: "spread", d, fill: color }));
           /* the stretch below one reading of the clock is drawn thin: that much of the distance
              from the median is the clock's doing, not the subject's */
-          const from = Math.min(xm, x99), solid = clock ? Math.max(from, Math.min(x(clock), x99)) : from;
+          const from = Math.min(xm, x99), solid = floor ? Math.max(from, Math.min(x(floor), x99)) : from;
           if (solid - from > 1) row.append(svg("line", { class: "under", x1: from, x2: solid, y1: by, y2: by, stroke: color }));
           row.append(svg("line", { class: "tail", x1: solid, x2: Math.max(xm, x999), y1: by, y2: by, stroke: color }));
           if (xmax - x999 > 6) row.append(svg("line", { class: "far", x1: x999 + 2, x2: xmax - 4, y1: by, y2: by, stroke: color }));
@@ -904,8 +907,9 @@ function renderDist() {
   const root = svg("svg", { viewBox: `0 0 ${W} ${H}`, height: H, role: "img",
     "aria-label": `How long the single ${g.op}s of ${shown.map((d) => d.s.name).join(" and ")} took: 99% within ${fmt(main.e.p99)}, 99.9% within ${fmt(main.e.p999)}, slowest ${fmt(main.e.max)} for ${main.s.name}.` });
 
-  const clock = main.e.clock;
-  if (clock && scale.pos(clock) > 0) root.append(svg("rect", { class: "floor", x: padL, y: top, width: x(clock) - padL, height: plotH }));
+  /* shaded up to the fastest timing drawn, as in the ranked chart */
+  const clock = main.e.clock, floor = clock ? Math.min(clock, ...shown.map((d) => d.bs[0].lo)) : null;
+  if (floor && scale.pos(floor) > 0) root.append(svg("rect", { class: "floor", x: padL, y: top, width: x(floor) - padL, height: plotH }));
   const pct = (e) => (e >= 0 ? "100%" : e >= -2 ? `${Math.pow(10, e + 2)}%` : `0.${"0".repeat(-e - 3)}1%`);
   const step = yHi - Math.ceil(yLo) > 5 ? 2 : 1;
   for (let e = yHi; e >= yLo; e -= step) {
@@ -942,7 +946,7 @@ function renderDist() {
     if (mx - lastLabel > 44) { root.append(svg("text", { class: "marklabel", x: mx, y: top - 8, "text-anchor": "middle" }, label)); lastLabel = mx; }
   }
   host.append(root);
-  note.textContent = `The dashed lines are ${main.s.name}'s.` + (clock ? ` Each time includes one reading of the clock (about ${fmt(clock)}), so nothing is in the shaded part.` : "")
+  note.textContent = `The dashed lines are ${main.s.name}'s.` + (clock ? ` Each time includes one reading of the clock (about ${fmt(clock)}): the shaded part is faster than any of them was.` : "")
     + " A bucket is an eighth of a doubling wide.";
 }
 function fitNames(root, sel, max) {
